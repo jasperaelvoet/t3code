@@ -585,6 +585,9 @@ importers:
       '@t3tools/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@t3tools/mobile-device-stream-native':
+        specifier: file:./modules/t3-device-stream
+        version: file:apps/mobile/modules/t3-device-stream
       '@t3tools/mobile-highlights-native':
         specifier: file:./modules/t3-highlights
         version: file:apps/mobile/modules/t3-highlights
@@ -6509,6 +6512,9 @@ packages:
   '@szmarczak/http-timer@4.0.6':
     resolution: {integrity: sha512-4BAffykYOgO+5nzBWYwE3W90sBgLJoUPRWWcL8wlyiM8IB8ipJz3UMJ9KXQd1RKQXpKp8Tutn80HZtWsu2u76w==}
     engines: {node: '>=10'}
+
+  '@t3tools/mobile-device-stream-native@file:apps/mobile/modules/t3-device-stream':
+    resolution: {directory: apps/mobile/modules/t3-device-stream, type: directory}
 
   '@t3tools/mobile-highlights-native@file:apps/mobile/modules/t3-highlights':
     resolution: {directory: apps/mobile/modules/t3-highlights, type: directory}
@@ -16047,6 +16053,8 @@ snapshots:
   '@szmarczak/http-timer@4.0.6':
     dependencies:
       defer-to-connect: 2.0.1
+
+  '@t3tools/mobile-device-stream-native@file:apps/mobile/modules/t3-device-stream': {}
 
   '@t3tools/mobile-highlights-native@file:apps/mobile/modules/t3-highlights': {}
 

@@ -265,6 +265,8 @@ const config: ExpoConfig = {
       NSAppTransportSecurity: {
         NSAllowsArbitraryLoads: true,
       },
+      // Lets the direct device stream hold ProMotion at 120 Hz, so frames wait less for a refresh.
+      CADisableMinimumFrameDurationOnPhone: true,
       NSLocalNetworkUsageDescription:
         "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
       NSPhotoLibraryAddUsageDescription: "Allow T3 Code to save images to your photo library.",

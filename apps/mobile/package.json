@@ -70,6 +70,7 @@
     "@react-navigation/native-stack": "7.21.0",
     "@t3tools/client-runtime": "workspace:*",
     "@t3tools/contracts": "workspace:*",
+    "@t3tools/mobile-device-stream-native": "file:./modules/t3-device-stream",
     "@t3tools/mobile-highlights-native": "file:./modules/t3-highlights",
     "@t3tools/mobile-review-diff-native": "file:./modules/t3-review-diff",
     "@t3tools/mobile-source-text": "file:./modules/t3-source-text",

@@ -1,0 +1,7 @@
+{
+  "platforms": ["apple"],
+  "apple": {
+    "modules": ["T3DeviceStreamModule"],
+    "podspecPath": "T3DeviceStreamNative.podspec"
+  }
+}

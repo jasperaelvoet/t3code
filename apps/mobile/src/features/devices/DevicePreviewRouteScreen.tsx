@@ -36,6 +36,7 @@ import { deviceEnvironment, useDeviceHubAccess } from "../../state/device";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
+import { DeviceDirectStream, supportsDirectStream } from "./DeviceDirectStream";
 import { DeviceStreamWebView, type DeviceStreamRef } from "./DeviceStreamWebView";
 import {
   selectedThreadDevicePreview,
@@ -405,6 +406,23 @@ function OpenDevicePreview({
   const [viewer] = useState(uuidv4);
   const { access, error, refresh } = useDeviceHubAccess(environmentId, session.hostId, viewer);
   const onUnauthorized = async () => refresh();
+  // Simlock hosts speak only serve-sim's protocol through their own gateway, and Android has its own.
+  const [direct, setDirect] = useState(
+    supportsDirectStream && session.platform === "ios" && !preview.serveSimOnly,
+  );
+  if (direct) {
+    return (
+      <DeviceDirectStream
+        ref={streamRef}
+        environmentId={environmentId}
+        hostId={session.hostId}
+        deviceId={session.deviceId}
+        background={themeVariables["--color-sheet-solid"]}
+        onInputConnected={onInputConnected}
+        onUnavailable={() => setDirect(false)}
+      />
+    );
+  }
   return access ? (
     <DeviceStreamWebView
       ref={streamRef}

@@ -133,6 +133,30 @@ Claude's native subagents never see the session's system prompt, so a
 `SubagentStart` hook passes them the block, where the runtime runs hooks and the
 subagent's context is not isolated.
 
+## The iOS app streams simulators directly
+
+Watching a simulator from a phone is only usable if a touch lands within a few frames, and what costs
+time there is the WebView: canvas copies, JavaScript on every touch, and a WebRTC jitter buffer built
+for calls. So the iOS app has its own path, the same way game streaming does it. The
+[server](../../apps/server/src/device/directStream/DirectStreamSession.ts) sends the hub's H.264 over
+UDP with no buffering, and a [native module](../../apps/mobile/modules/t3-device-stream) decodes it in
+hardware into a display layer and sends touches back from the main thread.
+
+The viewer gets a one-session AES key by asking
+[the route](../../apps/server/src/device/DirectStreamRoute.ts) over the authenticated environment
+connection, so UDP needs no auth of its own: a datagram that fails AEAD is dropped, an old one cannot
+move the stream to another address, and only the input tags the app needs reach the hub.
+
+Loss is repaired in order of cost. Reed-Solomon parity sent with each frame needs no round trip; a NACK
+costs one, which on Wi-Fi is shorter than a frame; a keyframe restarts the hub's feed, because only a
+new AVCC subscription forces one, so it is the last resort. A frame cannot be skipped: H.264 needs its
+references, so a frame that stays incomplete means showing nothing new until that keyframe.
+
+UDP cannot cross T3's relay, so this needs a route to the machine: the same network or a tailnet. The
+offer lists every address the server has, the viewer tries them all at once, and when none answers
+within 1.5 s the preview falls back to the WebView's H.264 over HTTP. The proxy and the hub are
+unchanged, and web and Android clients do not use this.
+
 ## The viewer decodes both vendored protocols
 
 The hub vendors two streaming servers with different wire formats. iOS video is
