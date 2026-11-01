@@ -88,6 +88,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import {
+  ActionSheetIOS,
   AppState,
   Keyboard,
   Platform,
@@ -402,6 +403,34 @@ function ThreadDetailBody(
     deviceEnvironment.state({ environmentId: props.environmentId, input: {} }),
   );
   const devicePreviews = threadDevicePreviews(deviceState.data, props.selectedThread.id);
+  const openDevice = useAtomCommand(deviceEnvironment.open, "open device");
+  const openableDevices = (deviceState.data?.devices ?? []).filter((device) => !device.physical);
+  const awaitingDevicePreview = useRef(false);
+  const pickDevice = () => {
+    Keyboard.dismiss();
+    const labels = openableDevices.map((device) =>
+      device.version ? `${device.name} · ${device.version}` : device.name,
+    );
+    ActionSheetIOS.showActionSheetWithOptions(
+      { title: "Open a device", options: [...labels, "Cancel"], cancelButtonIndex: labels.length },
+      (index) => {
+        const device = openableDevices[index];
+        if (!device) return;
+        awaitingDevicePreview.current = true;
+        void openDevice({
+          environmentId: props.environmentId,
+          input: {
+            threadId: props.selectedThread.id,
+            hostId: device.hostId,
+            deviceId: device.id,
+            platform: device.platform,
+          },
+        }).then((result) => {
+          if (result._tag === "Failure") awaitingDevicePreview.current = false;
+        });
+      },
+    );
+  };
   const openDevicePreview = () => {
     Keyboard.dismiss();
     if (
@@ -422,6 +451,14 @@ function ThreadDetailBody(
     enabled:
       !props.draftMode && props.serverConfig?.environment.capabilities.serverBrowser === true,
   });
+  const showOpenedDevice = useEffectEvent(openDevicePreview);
+  const devicePreviewCount = devicePreviews.length;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the opened device's session arrives over the state subscription, after the open command returns
+  useEffect(() => {
+    if (!awaitingDevicePreview.current || devicePreviewCount === 0) return;
+    awaitingDevicePreview.current = false;
+    showOpenedDevice();
+  }, [devicePreviewCount]);
   const openBrowserPreview = (tabId?: string) => {
     Keyboard.dismiss();
     navigation.navigate("ThreadBrowserPreview", {
@@ -1523,7 +1560,9 @@ function ThreadDetailBody(
                     devicePreview={
                       devicePreviews.length > 0
                         ? { count: devicePreviews.length, onPress: openDevicePreview }
-                        : null
+                        : Platform.OS === "ios" && openableDevices.length > 0
+                          ? { count: 0, onPress: pickDevice }
+                          : null
                     }
                     browserPreview={
                       browserTabs.tabs.length > 0

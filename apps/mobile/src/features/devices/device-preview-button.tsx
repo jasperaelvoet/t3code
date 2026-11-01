@@ -12,8 +12,18 @@ export function DevicePreviewButton(props: {
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={props.count === 1 ? "View device" : `View ${props.count} devices`}
-      accessibilityHint="Watch and control devices open in this thread"
+      accessibilityLabel={
+        props.count === 0
+          ? "Open a device"
+          : props.count === 1
+            ? "View device"
+            : `View ${props.count} devices`
+      }
+      accessibilityHint={
+        props.count === 0
+          ? "Choose a simulator or emulator to open in this thread"
+          : "Watch and control devices open in this thread"
+      }
       onPress={props.onPress}
       className={
         compact
@@ -29,7 +39,11 @@ export function DevicePreviewButton(props: {
       />
       {!compact ? (
         <AppText className="font-t3-medium text-xs text-foreground">
-          {props.count === 1 ? "One device open" : `${props.count} devices open`}
+          {props.count === 0
+            ? "Open device"
+            : props.count === 1
+              ? "One device open"
+              : `${props.count} devices open`}
         </AppText>
       ) : props.count > 1 ? (
         <View className="absolute right-1.5 top-1.5 min-w-4 items-center rounded-full bg-primary px-1">
