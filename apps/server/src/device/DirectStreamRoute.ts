@@ -1,14 +1,16 @@
 // Starts direct device streams. The route only hands out an offer: the viewer proves itself to the
 // UDP socket with the offer's key, which it can only get from here, over the environment connection.
-import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, LOCAL_DEVICE_HOST_ID } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { authenticateMediaRequest } from "../auth/http.ts";
+import * as ServerConfig from "../config.ts";
 import * as DeviceService from "./DeviceService.ts";
 import { DirectStreamSession } from "./directStream/DirectStreamSession.ts";
+import { ensureSimCaptureTool, makeSimCaptureSource } from "./directStream/SimCaptureSource.ts";
 
 const DIRECT_STREAM_PATH = `${DeviceService.DEVICE_HUB_ROUTE_PREFIX}/direct-stream`;
 
@@ -34,11 +36,24 @@ const handler = Effect.fn("DirectStreamRoute.handler")(function* (
   if (ready.upstream) {
     return HttpServerResponse.text("This host cannot stream directly", { status: 409 });
   }
+  // The capture tool has to run on the simulator's machine; an SSH host's stays on the hub's H.264.
+  const { baseDir } = yield* ServerConfig.ServerConfig;
+  const captureTool =
+    hostId === undefined || hostId === LOCAL_DEVICE_HOST_ID
+      ? yield* Effect.promise(() => ensureSimCaptureTool(baseDir))
+      : null;
+  const codec = url.value.searchParams.get("codecs")?.split(",").includes("hevc") ? "hevc" : "h264";
   const sessionKey = `${hostId ?? ""}:${deviceId}`;
   sessions.get(sessionKey)?.stop("replaced by a new viewer");
   const session: DirectStreamSession = new DirectStreamSession({
     hubOrigin: ready.hub.origin,
     deviceId,
+    ...(captureTool
+      ? {
+          makeVideoSource: (bitsPerSecond: number) =>
+            makeSimCaptureSource({ binary: captureTool, deviceId, codec, bitsPerSecond }),
+        }
+      : {}),
     onEnd: () => {
       if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
     },

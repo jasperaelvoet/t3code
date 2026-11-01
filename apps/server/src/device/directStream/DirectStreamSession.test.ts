@@ -7,9 +7,12 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { NodeWS } from "@effect/platform-node/NodeSocket";
 
 import { DirectStreamSession, type DirectStreamOffer } from "./DirectStreamSession.ts";
+import type { CaptureCodec, DirectVideoSource } from "./SimCaptureSource.ts";
 import {
   decodeVideoShard,
+  FRAME_FLAG_HEVC,
   FRAME_FLAG_KEY,
+  FRAME_FLAG_PARAMETER_SETS,
   MessageType,
   openPacket,
   sealPacket,
@@ -262,6 +265,105 @@ describe("DirectStreamSession", () => {
     session.stop();
     await hub.changes.until(() => hub.settings.length === 2);
     expect(JSON.parse(hub.settings[1]!)).toEqual({ h264Fps: 60 });
+  });
+
+  function fakeSource(codec: CaptureCodec = "hevc") {
+    const calls = { keyframes: 0, bitrates: [] as Array<number>, stopped: 0 };
+    let emit: ((tag: number, payload: Buffer) => void) | null = null;
+    let end: ((reason: string) => void) | null = null;
+    const source: DirectVideoSource = {
+      codec,
+      start: (onMessage, onEnd) => {
+        emit = onMessage;
+        end = onEnd;
+      },
+      requestKeyframe: () => {
+        calls.keyframes++;
+      },
+      setBitrate: (bits) => {
+        calls.bitrates.push(bits);
+      },
+      stop: () => {
+        calls.stopped++;
+      },
+    };
+    return {
+      source,
+      calls,
+      emit: (tag: number, payload: Buffer) => emit?.(tag, payload),
+      end: (reason: string) => end?.(reason),
+    };
+  }
+
+  async function connectedWith(fake: ReturnType<typeof fakeSource>) {
+    const hub = await fakeHub();
+    const session = new DirectStreamSession({
+      hubOrigin: hub.origin,
+      deviceId: DEVICE,
+      makeVideoSource: () => fake.source,
+    });
+    const offer = await session.start();
+    const client = viewer(offer);
+    cleanups.push(() => {
+      client.close();
+      session.stop();
+      hub.close();
+    });
+    client.send(Buffer.from([MessageType.hello]));
+    await client.changes.until(() => client.ofType(MessageType.helloAck).length > 0);
+    return { hub, session, client };
+  }
+
+  it("streams the session's own encoder and marks the frames HEVC", async () => {
+    const fake = fakeSource();
+    const { hub, client } = await connectedWith(fake);
+    fake.emit(1, Buffer.from([4, 1, 0, 1, 0x40]));
+    fake.emit(2, Buffer.alloc(100, 9));
+    await client.changes.until(() => client.ofType(MessageType.video).length >= 3);
+    const shard = decodeVideoShard(client.ofType(MessageType.video)[0]!)!;
+    expect(shard.header.flags).toBe(FRAME_FLAG_KEY | FRAME_FLAG_HEVC | FRAME_FLAG_PARAMETER_SETS);
+    expect(hub.videoRequests()).toBe(0);
+  });
+
+  it("asks the session's encoder for a keyframe without reopening anything", async () => {
+    const fake = fakeSource();
+    const { hub, client } = await connectedWith(fake);
+    client.send(Buffer.from([MessageType.keyframeRequest]));
+    await client.roundTrip();
+    expect(fake.calls.keyframes).toBe(1);
+    expect(hub.videoRequests()).toBe(0);
+  });
+
+  it("falls back to the hub's video when the capture tool dies", async () => {
+    const fake = fakeSource();
+    const { hub, session } = await connectedWith(fake);
+    fake.end("capture exited (1)");
+    await hub.changes.until(() => hub.videoRequests() === 1);
+    expect(session.stats.videoSource).toBe("hub");
+    expect(session.stats.sourceEndedBecause).toBe("capture exited (1)");
+  });
+
+  it("follows the viewer's feedback with the encoder's bitrate", async () => {
+    const fake = fakeSource();
+    const { client } = await connectedWith(fake);
+    const report = (lossPerMille: number) => {
+      const feedback = Buffer.alloc(5);
+      feedback[0] = MessageType.feedback;
+      feedback.writeUInt16BE(lossPerMille, 1);
+      feedback.writeUInt16BE(50, 3);
+      client.send(feedback);
+    };
+    report(200);
+    report(200);
+    await client.roundTrip();
+    expect(fake.calls.bitrates).toEqual([9_000_000]);
+  });
+
+  it("stops the capture tool with the session", async () => {
+    const fake = fakeSource();
+    const { session } = await connectedWith(fake);
+    session.stop();
+    expect(fake.calls.stopped).toBe(1);
   });
 
   it("tells the caller why it ended", async () => {

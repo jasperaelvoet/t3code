@@ -8,9 +8,12 @@ import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 
+import { initialQuality, nextQuality, type QualityState } from "./adaptiveQuality.ts";
 import {
   encodeVideoShard,
+  FRAME_FLAG_HEVC,
   FRAME_FLAG_KEY,
+  FRAME_FLAG_PARAMETER_SETS,
   MessageType,
   NACK_WHOLE_FRAME,
   openPacket,
@@ -18,10 +21,10 @@ import {
   SHARD_BYTES,
 } from "./protocol.ts";
 import { encodeParity } from "./reedSolomon.ts";
+import type { DirectVideoSource } from "./SimCaptureSource.ts";
 
 const MAX_GROUP_DATA_SHARDS = 48;
 const MIN_PARITY_SHARDS = 2;
-const PARITY_RATIO = 0.2;
 const RETAINED_FRAMES = 120;
 /** Keyframes are large; sending one at line rate overruns Wi-Fi queues and costs the frame. */
 const PACED_BYTES_PER_MS = 45_000;
@@ -57,8 +60,10 @@ export interface DirectStreamOptions {
   /** Called once when the session ends for any reason, including `stop()`. */
   readonly onEnd?: (reason: string) => void;
   readonly includeLoopbackAddress?: boolean;
-  /** The hub's capture rate during this session; the previous rate returns when it ends. */
+  /** The hub's capture rate while this session reads the hub's video. */
   readonly captureFps?: number;
+  /** Encodes for this session alone. The hub's H.264 takes over if this is absent or fails. */
+  readonly makeVideoSource?: (bitsPerSecond: number) => DirectVideoSource;
 }
 
 export interface DirectStreamOffer {
@@ -78,6 +83,10 @@ export interface DirectStreamStats {
   keyframeRequests: number;
   framesSkipped: number;
   inputsForwarded: number;
+  bitrateChanges: number;
+  videoSource: "capture" | "hub" | "none";
+  codec: string;
+  sourceEndedBecause: string | null;
 }
 
 type ViewerAddress = { readonly address: string; readonly port: number };
@@ -106,6 +115,10 @@ export class DirectStreamSession {
     keyframeRequests: 0,
     framesSkipped: 0,
     inputsForwarded: 0,
+    bitrateChanges: 0,
+    videoSource: "none",
+    codec: "none",
+    sourceEndedBecause: null,
   };
 
   private readonly options: DirectStreamOptions;
@@ -138,6 +151,9 @@ export class DirectStreamSession {
   private hubRetry: ReturnType<typeof setTimeout> | null = null;
   private checkTimer: ReturnType<typeof setInterval> | null = null;
   private restoreCaptureFps: number | null = null;
+  private videoSource: DirectVideoSource | null = null;
+  private videoFlags = 0;
+  private quality: QualityState = initialQuality;
 
   constructor(options: DirectStreamOptions) {
     this.options = options;
@@ -159,7 +175,6 @@ export class DirectStreamSession {
       // The system default still works; a keyframe may just need its NACKs.
     }
     this.checkTimer = setInterval(() => this.checkAlive(), CHECK_INTERVAL_MS);
-    await this.raiseCaptureRate();
     void this.connectHubInput();
     return {
       sessionId: this.sessionId,
@@ -178,6 +193,8 @@ export class DirectStreamSession {
     this.avccGeneration++;
     this.avccRequest?.destroy();
     this.avccRequest = null;
+    this.videoSource?.stop();
+    this.videoSource = null;
     this.hubSocket?.close();
     this.hubSocket = null;
     if (this.restoreCaptureFps !== null) {
@@ -195,7 +212,10 @@ export class DirectStreamSession {
     const current = await this.hubSettings("GET");
     if (typeof current?.h264Fps !== "number" || current.h264Fps === target) return;
     const applied = await this.hubSettings("PATCH", { h264Fps: target });
-    if (applied) this.restoreCaptureFps = current.h264Fps;
+    if (!applied) return;
+    // The session may have ended while this was on its way, and then nothing else restores it.
+    if (this.stopped) void this.hubSettings("PATCH", { h264Fps: current.h264Fps });
+    else this.restoreCaptureFps = current.h264Fps;
   }
 
   /** A failure leaves the rate as it was; the stream works at any rate. */
@@ -271,6 +291,9 @@ export class DirectStreamSession {
       case MessageType.input:
         this.handleInput(plaintext);
         break;
+      case MessageType.feedback:
+        this.handleFeedback(plaintext);
+        break;
       case MessageType.bye:
         this.stop("viewer closed");
         break;
@@ -282,7 +305,49 @@ export class DirectStreamSession {
     this.sendControl(Buffer.concat([Buffer.from([MessageType.helloAck]), hello.subarray(1)]));
     if (this.screenConfig) this.sendScreen();
     this.sendInputState();
-    if (!this.avccRequest) this.openVideo();
+    if (!this.videoSource && !this.avccRequest) this.startVideo();
+  }
+
+  private startVideo() {
+    const source = this.options.makeVideoSource?.(this.quality.bitsPerSecond);
+    if (!source) return this.startHubVideo();
+    this.videoSource = source;
+    this.stats.videoSource = "capture";
+    this.stats.codec = source.codec;
+    this.videoFlags = FRAME_FLAG_PARAMETER_SETS | (source.codec === "hevc" ? FRAME_FLAG_HEVC : 0);
+    source.start(
+      (tag, payload) => {
+        if (this.videoSource === source) this.handleAvcc(tag, payload);
+      },
+      (reason) => {
+        if (this.stopped || this.videoSource !== source) return;
+        this.videoSource = null;
+        this.stats.sourceEndedBecause = reason;
+        this.startHubVideo();
+      },
+    );
+  }
+
+  private startHubVideo() {
+    this.stats.videoSource = "hub";
+    this.stats.codec = "h264";
+    this.videoFlags = 0;
+    void this.raiseCaptureRate();
+    this.openVideo();
+  }
+
+  private handleFeedback(feedback: Buffer) {
+    if (feedback.length < 5) return;
+    const previous = this.quality.bitsPerSecond;
+    this.quality = nextQuality(this.quality, {
+      lossPerMille: feedback.readUInt16BE(1),
+      roundTripMs: feedback.readUInt16BE(3) / 10,
+    });
+    // The hub's encoder is shared with every other viewer, so only our own follows the link.
+    if (this.videoSource && this.quality.bitsPerSecond !== previous) {
+      this.videoSource.setBitrate(this.quality.bitsPerSecond);
+      this.stats.bitrateChanges++;
+    }
   }
 
   private handlePing(ping: Buffer) {
@@ -407,6 +472,11 @@ export class DirectStreamSession {
     this.stats.keyframeRequests++;
     const now = performance.now();
     if (now - this.lastKeyframeRequestAt < KEYFRAME_REQUEST_MIN_INTERVAL_MS) return;
+    if (this.videoSource) {
+      this.lastKeyframeRequestAt = now;
+      this.videoSource.requestKeyframe();
+      return;
+    }
     if (
       this.keyframePendingSince !== null &&
       now - this.keyframePendingSince < KEYFRAME_PENDING_GRACE_MS
@@ -462,11 +532,14 @@ export class DirectStreamSession {
     } else if (tag === AVCC_TAG_KEYFRAME && this.description) {
       const length = Buffer.allocUnsafe(2);
       length.writeUInt16BE(this.description.length, 0);
-      this.sendFrame(Buffer.concat([length, this.description, payload]), FRAME_FLAG_KEY);
+      this.sendFrame(
+        Buffer.concat([length, this.description, payload]),
+        FRAME_FLAG_KEY | this.videoFlags,
+      );
       this.stats.keyframesSent++;
       this.keyframePendingSince = null;
     } else if (tag === AVCC_TAG_DELTA) {
-      this.sendFrame(payload, 0);
+      this.sendFrame(payload, this.videoFlags);
     }
   }
 
@@ -480,7 +553,10 @@ export class DirectStreamSession {
     for (let group = 0; group < groupCount; group++) {
       const first = group * MAX_GROUP_DATA_SHARDS;
       const dataShards = Math.min(MAX_GROUP_DATA_SHARDS, shardCount - first);
-      const parityShards = Math.max(MIN_PARITY_SHARDS, Math.ceil(dataShards * PARITY_RATIO));
+      const parityShards = Math.max(
+        MIN_PARITY_SHARDS,
+        Math.ceil(dataShards * this.quality.parityRatio),
+      );
       const data: Array<Uint8Array> = [];
       for (let index = 0; index < dataShards; index++) {
         const start = (first + index) * SHARD_BYTES;

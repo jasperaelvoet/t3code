@@ -142,15 +142,32 @@ for calls. So the iOS app has its own path, the same way game streaming does it.
 UDP with no buffering, and a [native module](../../apps/mobile/modules/t3-device-stream) decodes it in
 hardware into a display layer and sends touches back from the main thread.
 
+The server also skips the hub's encoder when it can.
+[`simCaptureToolSource.ts`](../../apps/server/src/device/directStream/simCaptureToolSource.ts) holds a
+small native tool, compiled on the host at first use, that registers for CoreSimulator's per-frame
+callback rather than polling the framebuffer, and encodes each frame in hardware. A session owns that
+encoder, so it can use HEVC when the phone decodes it, force a keyframe at once, and change its bitrate
+as the link changes, none of which is possible on the hub's shared encoder. It relies on private
+CoreSimulator API, so when the tool cannot build or dies the session continues on the hub's H.264. AV1
+is not an option: Apple silicon decodes it but has no hardware encoder for it. The simulator draws at
+60 fps, so capture cannot produce more; a 120 Hz display only shortens the wait for a refresh.
+
 The viewer gets a one-session AES key by asking
 [the route](../../apps/server/src/device/DirectStreamRoute.ts) over the authenticated environment
 connection, so UDP needs no auth of its own: a datagram that fails AEAD is dropped, an old one cannot
 move the stream to another address, and only the input tags the app needs reach the hub.
 
-Loss is repaired in order of cost. Reed-Solomon parity sent with each frame needs no round trip; a NACK
-costs one, which on Wi-Fi is shorter than a frame; a keyframe restarts the hub's feed, because only a
-new AVCC subscription forces one, so it is the last resort. A frame cannot be skipped: H.264 needs its
-references, so a frame that stays incomplete means showing nothing new until that keyframe.
+Loss is repaired in order of cost. Reed-Solomon parity sent with each frame needs no round trip, and
+its share rises with reported loss; a NACK costs one, which on Wi-Fi is shorter than a frame; a keyframe
+is the last resort. A frame cannot be skipped: H.264 and HEVC need their references, so a frame that
+stays incomplete means showing nothing new until that keyframe. Twice a second the viewer reports loss
+and round trip, and [`adaptiveQuality.ts`](../../apps/server/src/device/directStream/adaptiveQuality.ts)
+backs the bitrate off quickly under sustained loss or queueing and raises it slowly otherwise.
+
+Most of what is left of the stutter is Wi-Fi: frames leave evenly and can reach a phone up to 190 ms
+late with no loss at all, in clusters about one beacon interval apart. The viewer sends a small packet
+every 10 ms with the video service class to discourage radio power saving. That helped in most test
+runs but not all, so treat it as a mitigation.
 
 UDP cannot cross T3's relay, so this needs a route to the machine: the same network or a tailnet. The
 offer lists every address the server has, the viewer tries them all at once, and when none answers

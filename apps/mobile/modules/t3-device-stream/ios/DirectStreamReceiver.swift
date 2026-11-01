@@ -22,9 +22,16 @@ final class DirectStreamReceiver {
 
   var onConnected: ((_ endpoint: String) -> Void)?
   var onFailed: ((_ reason: String) -> Void)?
-  var onFrame: ((_ frame: Data, _ isKey: Bool) -> Void)?
+  var onFrame: ((_ frame: Data, _ flags: UInt8) -> Void)?
+  /// When the host sent the frame being delivered, on its own clock in microseconds.
+  var onFrameTiming: ((_ sentAtMicros: UInt32) -> Void)?
   var onScreen: ((_ json: Data) -> Void)?
   var onInputState: ((_ admitted: Bool) -> Void)?
+
+  /// How often to send a small packet upstream, in milliseconds; 0 disables it.
+  var heartbeatIntervalMs: Double = 10
+  /// SO_NET_SERVICE_TYPE: 3 is interactive video, 4 is interactive voice.
+  var networkServiceType: Int32 = 3
 
   private let crypto: DirectStreamCrypto
   private let endpoints: [sockaddr_in]
@@ -49,6 +56,11 @@ final class DirectStreamReceiver {
   private var lastKeyRequestAt: Double = 0
   private var lastHelloAt: Double = 0
   private var lastPingAt: Double = 0
+  private var lastHeartbeatAt: Double = 0
+  private var lastFeedbackAt: Double = 0
+  private var highestSequence: UInt64 = 0
+  private var windowFirstSequence: UInt64?
+  private var windowPackets = 0
   private var lastHeardAt: Double = 0
   private var startedAt: Double = 0
   private var gapSince: Double = 0
@@ -73,14 +85,18 @@ final class DirectStreamReceiver {
     let id: UInt32
     let flags: UInt8
     let frameBytes: Int
+    let sentAtMicros: UInt32
     var groups: [Group?]
     var completeGroups = 0
     var lastShardAt: Double
     var lastNackAt: Double = 0
     var nacks = 0
     var payload: Data?
-    init(id: UInt32, flags: UInt8, groupCount: Int, frameBytes: Int, now: Double) {
+    init(
+      id: UInt32, flags: UInt8, groupCount: Int, frameBytes: Int, sentAtMicros: UInt32, now: Double
+    ) {
       self.id = id
+      self.sentAtMicros = sentAtMicros
       self.flags = flags
       self.frameBytes = frameBytes
       groups = Array(repeating: nil, count: groupCount)
@@ -134,7 +150,7 @@ final class DirectStreamReceiver {
     setsockopt(
       socketFd, SOL_SOCKET, SO_RCVBUF, &receiveBuffer, socklen_t(MemoryLayout<Int32>.size))
     // Interactive video service class, so Wi-Fi uses its video access category.
-    var serviceType: Int32 = 3
+    var serviceType = networkServiceType
     setsockopt(socketFd, SOL_SOCKET, 0x1116, &serviceType, socklen_t(MemoryLayout<Int32>.size))
     var timeout = timeval(tv_sec: 0, tv_usec: 2000)
     setsockopt(
@@ -213,6 +229,10 @@ final class DirectStreamReceiver {
         let packet = UnsafeRawBufferPointer(start: buffer, count: received)
         if let plaintext = crypto.open(packet: packet) {
           lastHeardAt = now
+          let sequence = packet.loadUnaligned(fromByteOffset: 4, as: UInt64.self).bigEndian
+          if windowFirstSequence == nil { windowFirstSequence = sequence }
+          highestSequence = max(highestSequence, sequence)
+          windowPackets += 1
           handle(plaintext, from: source, now: now)
         }
       }
@@ -268,6 +288,11 @@ final class DirectStreamReceiver {
       return
     }
     if now - lastPingAt > 250 { sendPing(now: now) }
+    if now - lastFeedbackAt > 500 { sendFeedback(now: now) }
+    if heartbeatIntervalMs > 0 && now - lastHeartbeatAt >= heartbeatIntervalMs {
+      lastHeartbeatAt = now
+      send(Data([DirectStreamWire.Message.heartbeat]))
+    }
     checkMissingFrames(now: now)
   }
 
@@ -283,6 +308,24 @@ final class DirectStreamReceiver {
     running = false
     lock.unlock()
     if wasRunning { onFailed?(reason) }
+  }
+
+  /// Sequence numbers count every packet the host sent, so the gaps in them are what was lost.
+  private func sendFeedback(now: Double) {
+    lastFeedbackAt = now
+    guard let first = windowFirstSequence else { return }
+    let expected = Double(highestSequence &- first) + 1
+    let lost = max(0, expected - Double(windowPackets))
+    windowFirstSequence = nil
+    windowPackets = 0
+    guard expected >= 8 else { return }
+    let lossPerMille = UInt16(min(1000, lost / expected * 1000))
+    let roundTripTenths = UInt16(min(60000, roundTripMs * 10))
+    var message = Data(capacity: 5)
+    message.append(DirectStreamWire.Message.feedback)
+    withUnsafeBytes(of: lossPerMille.bigEndian) { message.append(contentsOf: $0) }
+    withUnsafeBytes(of: roundTripTenths.bigEndian) { message.append(contentsOf: $0) }
+    send(message)
   }
 
   private func sendPing(now: Double) {
@@ -350,10 +393,12 @@ final class DirectStreamReceiver {
     let index = Int(plaintext[start + 4])
     let dataShards = Int(plaintext[start + 5])
     let parityShards = Int(plaintext[start + 6])
-    let (frameId, frameBytes): (UInt32, UInt32) = plaintext.withUnsafeBytes { bytes in
+    let (frameId, frameBytes, sentAtMicros): (UInt32, UInt32, UInt32) = plaintext.withUnsafeBytes {
+      bytes in
       (
         bytes.loadUnaligned(fromByteOffset: 8, as: UInt32.self).bigEndian,
-        bytes.loadUnaligned(fromByteOffset: 12, as: UInt32.self).bigEndian
+        bytes.loadUnaligned(fromByteOffset: 12, as: UInt32.self).bigEndian,
+        bytes.loadUnaligned(fromByteOffset: 16, as: UInt32.self).bigEndian
       )
     }
     guard groupIndex < groupCount, index < dataShards + parityShards else { return }
@@ -368,7 +413,8 @@ final class DirectStreamReceiver {
       assembly = existing
     } else {
       assembly = Assembly(
-        id: frameId, flags: flags, groupCount: groupCount, frameBytes: Int(frameBytes), now: now)
+        id: frameId, flags: flags, groupCount: groupCount, frameBytes: Int(frameBytes),
+        sentAtMicros: sentAtMicros, now: now)
       frames[frameId] = assembly
     }
     assembly.lastShardAt = now
@@ -433,7 +479,8 @@ final class DirectStreamReceiver {
       statsStorage.framesDelivered += 1
       if isKey { statsStorage.keyframesDelivered += 1 }
       lock.unlock()
-      onFrame?(payload, isKey)
+      onFrameTiming?(assembly.sentAtMicros)
+      onFrame?(payload, assembly.flags)
     }
   }
 
@@ -447,7 +494,7 @@ final class DirectStreamReceiver {
       gapSince = 0
       return
     }
-    let nackDelay = max(2, min(12, (roundTripMs) * 1.2))
+    let nackDelay = max(5, min(15, roundTripMs * 1.2))
     if let assembly = frames[nextFrame] {
       if now - assembly.lastShardAt < nackDelay { return }
       if gapSince == 0 { gapSince = now }

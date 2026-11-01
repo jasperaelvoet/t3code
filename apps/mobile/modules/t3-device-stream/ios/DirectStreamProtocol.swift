@@ -8,6 +8,8 @@ enum DirectStreamWire {
   static let shardBytes = 1150
   static let videoPrefixBytes = 20
   static let frameFlagKey: UInt8 = 1
+  static let frameFlagHEVC: UInt8 = 2
+  static let frameFlagParameterSets: UInt8 = 4
   static let nackWholeFrame: UInt8 = 0xff
 
   enum Message {
@@ -17,6 +19,8 @@ enum DirectStreamWire {
     static let nack: UInt8 = 0x04
     static let input: UInt8 = 0x05
     static let bye: UInt8 = 0x06
+    static let heartbeat: UInt8 = 0x07
+    static let feedback: UInt8 = 0x08
     static let video: UInt8 = 0x10
     static let screen: UInt8 = 0x12
     static let inputState: UInt8 = 0x13

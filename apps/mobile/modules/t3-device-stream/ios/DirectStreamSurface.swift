@@ -18,6 +18,9 @@ final class DirectStreamSurface: UIView {
   private var activeTouch: UITouch?
   private var displayLink: CADisplayLink?
   private var formatDescription: CMVideoFormatDescription?
+  private let linkTarget = DisplayLinkTarget()
+  private var lastActivityAt = CACurrentMediaTime()
+  private var keepingRateUp = false
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -39,10 +42,13 @@ final class DirectStreamSurface: UIView {
     displayLink?.invalidate()
     displayLink = nil
     guard window != nil else { return }
-    // Holds ProMotion at its top rate: frames wait less for a refresh, and touches arrive sooner.
-    let link = CADisplayLink(target: DisplayLinkTarget.shared, selector: #selector(DisplayLinkTarget.tick))
+    // Asks for the top rate only while frames arrive, so one lands at the next 8 ms refresh rather
+    // than the next 16 ms one, and the display can slow down whenever the simulator is still.
+    let link = CADisplayLink(target: linkTarget, selector: #selector(DisplayLinkTarget.tick))
     link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
     link.add(to: .main, forMode: .common)
+    link.isPaused = true
+    linkTarget.surface = self
     displayLink = link
     becomeFirstResponder()
   }
@@ -83,8 +89,23 @@ final class DirectStreamSurface: UIView {
     CATransaction.commit()
   }
 
+  /// Called from any thread when something changes on screen.
+  private func noteActivity() {
+    lastActivityAt = CACurrentMediaTime()
+    guard !keepingRateUp else { return }
+    keepingRateUp = true
+    DispatchQueue.main.async { [weak self] in self?.displayLink?.isPaused = false }
+  }
+
+  fileprivate func relaxRateIfIdle() {
+    guard CACurrentMediaTime() - lastActivityAt > 0.5 else { return }
+    keepingRateUp = false
+    displayLink?.isPaused = true
+  }
+
   /// Safe from any one thread at a time; VideoToolbox's output callback calls this.
   func display(_ image: CVPixelBuffer) {
+    noteActivity()
     let size = CGSize(
       width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
     if size != videoSize {
@@ -140,12 +161,14 @@ final class DirectStreamSurface: UIView {
 
   override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
     guard activeTouch == nil, let touch = touches.first else { return }
+    noteActivity()
     activeTouch = touch
     report(touch, phase: "begin")
   }
 
   override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
     guard let activeTouch, touches.contains(activeTouch) else { return }
+    noteActivity()
     report(activeTouch, phase: "move")
   }
 
@@ -173,6 +196,9 @@ final class DirectStreamSurface: UIView {
 }
 
 private final class DisplayLinkTarget: NSObject {
-  static let shared = DisplayLinkTarget()
-  @objc func tick() {}
+  weak var surface: DirectStreamSurface?
+
+  @objc func tick() {
+    surface?.relaxRateIfIdle()
+  }
 }

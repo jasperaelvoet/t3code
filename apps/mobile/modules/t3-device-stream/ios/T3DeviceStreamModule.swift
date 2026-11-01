@@ -1,8 +1,13 @@
 import ExpoModulesCore
+import VideoToolbox
 
 public class T3DeviceStreamModule: Module {
   public func definition() -> ModuleDefinition {
     Name("T3DeviceStream")
+
+    Constants([
+      "supportsHEVC": VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+    ])
 
     View(T3DirectStreamView.self) {
       Events("onStreamStatus", "onInputConnected")

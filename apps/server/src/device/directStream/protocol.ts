@@ -22,6 +22,8 @@ export const MessageType = {
   nack: 0x04,
   input: 0x05,
   bye: 0x06,
+  heartbeat: 0x07,
+  feedback: 0x08,
   video: 0x10,
   screen: 0x12,
   inputState: 0x13,
@@ -31,6 +33,9 @@ export const MessageType = {
 } as const;
 
 export const FRAME_FLAG_KEY = 1;
+export const FRAME_FLAG_HEVC = 2;
+/** A keyframe's configuration is `u8 NAL length bytes | u8 count | { u16 length | set }`, not avcC. */
+export const FRAME_FLAG_PARAMETER_SETS = 4;
 /** In a NACK, asks for every shard of a frame the client has not heard of. */
 export const NACK_WHOLE_FRAME = 0xff;
 

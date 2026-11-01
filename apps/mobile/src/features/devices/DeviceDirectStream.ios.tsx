@@ -4,7 +4,7 @@ import {
   withDeviceHubQuery,
 } from "@t3tools/client-runtime/device/hub-access";
 import type { EnvironmentId } from "@t3tools/contracts";
-import { requireNativeView } from "expo";
+import { requireNativeModule, requireNativeView } from "expo";
 import { useEffect, useEffectEvent, useImperativeHandle, useRef, useState, type Ref } from "react";
 import { AppState, View, type ViewProps } from "react-native";
 
@@ -36,10 +36,12 @@ const NativeDirectStream = requireNativeView<
   }
 >("T3DeviceStream");
 
+const { supportsHEVC } = requireNativeModule<{ readonly supportsHEVC: boolean }>("T3DeviceStream");
+
 async function fetchOffer(access: DeviceHubAccess, deviceId: string, signal: AbortSignal) {
   const response = await fetch(
     withDeviceHubQuery(
-      `${access.httpBase}/direct-stream?device=${encodeURIComponent(deviceId)}`,
+      `${access.httpBase}/direct-stream?device=${encodeURIComponent(deviceId)}&codecs=${supportsHEVC ? "hevc,h264" : "h264"}`,
       access,
     ),
     { method: "POST", signal, credentials: access.credentials ? "include" : "same-origin" },

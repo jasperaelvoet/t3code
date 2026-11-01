@@ -29,17 +29,17 @@ final class DirectStreamDecoder {
     format = nil
   }
 
-  /// A key frame is prefixed with a u16 length and its avcC record. Delta frames are bare.
-  func decode(frame: Data, isKey: Bool) {
+  /// A keyframe starts with a u16 length and its configuration. Delta frames are bare.
+  func decode(frame: Data, flags: UInt8) {
     var payload = frame
-    if isKey {
+    if flags & DirectStreamWire.frameFlagKey != 0 {
       guard frame.count > 2 else { return }
       let length = Int(frame[frame.startIndex]) << 8 | Int(frame[frame.startIndex + 1])
       guard frame.count > 2 + length else { return }
       let description = frame.subdata(
         in: (frame.startIndex + 2)..<(frame.startIndex + 2 + length))
       payload = frame.subdata(in: (frame.startIndex + 2 + length)..<frame.endIndex)
-      guard configure(description: description) else {
+      guard configure(description: description, flags: flags) else {
         onNeedsKeyframe?()
         return
       }
@@ -72,8 +72,13 @@ final class DirectStreamDecoder {
     onNeedsKeyframe?()
   }
 
-  private func configure(description: Data) -> Bool {
-    guard let parsed = Self.formatDescription(avcC: description) else { return false }
+  private func configure(description: Data, flags: UInt8) -> Bool {
+    let parsed =
+      flags & DirectStreamWire.frameFlagParameterSets != 0
+      ? Self.formatDescription(
+        parameterSets: description, hevc: flags & DirectStreamWire.frameFlagHEVC != 0)
+      : Self.formatDescription(avcC: description)
+    guard let parsed else { return false }
     lengthBytes = parsed.lengthBytes
     if let session, let format,
       VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: parsed.format),
@@ -128,6 +133,40 @@ final class DirectStreamDecoder {
         sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr
     else { return nil }
     return sample
+  }
+
+  /// `u8 NAL length bytes | u8 count | { u16 length | set }`, from the host's capture tool.
+  private static func formatDescription(
+    parameterSets: Data, hevc: Bool
+  ) -> (format: CMVideoFormatDescription, lengthBytes: Int)? {
+    let bytes = [UInt8](parameterSets)
+    guard bytes.count > 2 else { return nil }
+    let lengthBytes = Int(bytes[0])
+    var offset = 2
+    var sets: [[UInt8]] = []
+    for _ in 0..<Int(bytes[1]) {
+      guard offset + 2 <= bytes.count else { return nil }
+      let length = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
+      offset += 2
+      guard offset + length <= bytes.count else { return nil }
+      sets.append(Array(bytes[offset..<(offset + length)]))
+      offset += length
+    }
+    guard !sets.isEmpty else { return nil }
+    var format: CMFormatDescription?
+    let status = withParameterSetPointers(sets) { pointers, sizes in
+      hevc
+        ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+          allocator: kCFAllocatorDefault, parameterSetCount: sets.count,
+          parameterSetPointers: pointers, parameterSetSizes: sizes,
+          nalUnitHeaderLength: Int32(lengthBytes), extensions: nil, formatDescriptionOut: &format)
+        : CMVideoFormatDescriptionCreateFromH264ParameterSets(
+          allocator: kCFAllocatorDefault, parameterSetCount: sets.count,
+          parameterSetPointers: pointers, parameterSetSizes: sizes,
+          nalUnitHeaderLength: Int32(lengthBytes), formatDescriptionOut: &format)
+    }
+    guard status == noErr, let format else { return nil }
+    return (format, lengthBytes)
   }
 
   private static func formatDescription(

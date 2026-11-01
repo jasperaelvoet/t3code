@@ -38,7 +38,7 @@ final class DirectStreamController {
 
   func start() {
     let receiver = receiver
-    receiver.onFrame = { [decoder] frame, isKey in decoder.decode(frame: frame, isKey: isKey) }
+    receiver.onFrame = { [decoder] frame, flags in decoder.decode(frame: frame, flags: flags) }
     decoder.onNeedsKeyframe = { [weak receiver] in receiver?.requestKeyframe() }
     decoder.onImage = { [weak self] image, _ in
       guard let self else { return }
