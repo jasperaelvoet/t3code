@@ -8,6 +8,7 @@ import {
 } from "./duoControl.ts";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
+import { withoutFrameReordering } from "./avcLowDelay.ts";
 import { createCanvasFrameSink, type DeviceFrameSink } from "./frame.ts";
 import { type DeviceHubAccess, withDeviceHubQuery } from "./hubAccess.ts";
 import type { DevicePlatform } from "@t3tools/contracts";
@@ -115,8 +116,6 @@ export interface DeviceStreamTarget {
   readonly platform: DevicePlatform;
   readonly deviceId: string;
   readonly access: DeviceHubAccess;
-  /** Native iOS WebViews can use MJPEG without cross-origin fetch or secure-context support. */
-  readonly preferMjpeg?: boolean;
   readonly panelId?: 1 | 3;
   readonly videoOnly?: boolean;
   /** The host speaks only serve-sim's AVCC stream and input socket, on both platforms (Simlock). */
@@ -414,8 +413,7 @@ export function createDeviceStreamClient(
   const httpUrl = (path: string) =>
     withDeviceHubQuery(`${access.httpBase}${vendor}${path}`, access);
   const wsUrl = (path: string) => withDeviceHubQuery(`${access.wsBase}${vendor}${path}`, access);
-  const useWebCodecs =
-    isWebCodecsSupported() && !(platform === "ios" && target.preferMjpeg && !serveSimOnly);
+  const useWebCodecs = isWebCodecsSupported();
 
   let stopped = true;
   let socket: WebSocket | null = null;
@@ -780,7 +778,7 @@ export function createDeviceStreamClient(
               const configured = await configureDecoder(
                 {
                   codec: avcCodecString(chunk.payload),
-                  description: chunk.payload,
+                  description: withoutFrameReordering(chunk.payload) ?? chunk.payload,
                 },
                 isCurrent,
               );

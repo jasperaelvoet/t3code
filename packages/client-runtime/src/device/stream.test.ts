@@ -88,7 +88,6 @@ describe("native device stream transport", () => {
       {
         platform,
         deviceId: "test device",
-        preferMjpeg: platform === "ios",
         access: {
           httpBase: "https://environment.test/api/device-hub",
           wsBase: "wss://environment.test/api/device-hub",
@@ -184,7 +183,6 @@ describe("iOS keypad protocol", () => {
       {
         platform: "ios",
         deviceId: "keypad-device",
-        preferMjpeg: true,
         access: {
           httpBase: "https://device.test",
           wsBase: "wss://device.test",
@@ -289,11 +287,7 @@ class MjpegImage extends EventTarget {
   }
 }
 
-function recoveryFixture(
-  platform: "ios" | "android" = "ios",
-  preferMjpeg = true,
-  serveSimOnly = false,
-) {
+function recoveryFixture(platform: "ios" | "android" = "ios", serveSimOnly = false) {
   vi.useFakeTimers();
   const sockets: Socket[] = [];
   class Socket {
@@ -369,7 +363,6 @@ function recoveryFixture(
   const client = createDeviceStreamClient(
     {
       platform,
-      preferMjpeg,
       serveSimOnly,
       deviceId: "test-device",
       access: {
@@ -424,7 +417,6 @@ describe("shared device stream readiness and recovery", () => {
   it("streams and drives a serve-sim-only Android device over serve-sim's AVCC and input socket", async () => {
     const { client, events, fetch, sockets, videoBodies, decoders } = recoveryFixture(
       "android",
-      false,
       true,
     );
     client.start();
@@ -472,7 +464,7 @@ describe("shared device stream readiness and recovery", () => {
   });
 
   it("does not repaint a delayed JPEG seed over newer decoded video", async () => {
-    const { client, videoBodies, drawImage, decodedFrame } = recoveryFixture("ios", false);
+    const { client, videoBodies, drawImage, decodedFrame } = recoveryFixture("ios");
     let resolveBitmap!: (bitmap: ImageBitmap) => void;
     vi.stubGlobal(
       "createImageBitmap",
@@ -531,7 +523,7 @@ describe("shared device stream readiness and recovery", () => {
   });
 
   it("ignores an old AVCC response rejected after a new attempt is connected", async () => {
-    const { client, fetch, events } = recoveryFixture("ios", false);
+    const { client, fetch, events } = recoveryFixture("ios");
     let resolveResponse!: (response: Response) => void;
     fetch.mockImplementationOnce(() => Promise.resolve(new Response("prime")));
     fetch.mockImplementationOnce(
