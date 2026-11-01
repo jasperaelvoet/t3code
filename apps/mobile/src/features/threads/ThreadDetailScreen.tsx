@@ -89,6 +89,7 @@ import {
 } from "react";
 import {
   ActionSheetIOS,
+  Alert,
   AppState,
   Keyboard,
   Platform,
@@ -404,17 +405,26 @@ function ThreadDetailBody(
   );
   const devicePreviews = threadDevicePreviews(deviceState.data, props.selectedThread.id);
   const openDevice = useAtomCommand(deviceEnvironment.open, "open device");
-  const openableDevices = (deviceState.data?.devices ?? []).filter((device) => !device.physical);
+  const listDevices = useAtomCommand(deviceEnvironment.list, "list devices");
+  const canPickDevice = Platform.OS === "ios" && deviceState.data?.onboardingCompleted === true;
   const awaitingDevicePreview = useRef(false);
-  const pickDevice = () => {
+  const pickDevice = async () => {
     Keyboard.dismiss();
-    const labels = openableDevices.map((device) =>
+    // The subscription lists nothing until a hub runs, and asking for the list is what starts one.
+    const listed = await listDevices({ environmentId: props.environmentId, input: {} });
+    if (listed._tag === "Failure") return;
+    const devices = listed.value.devices.filter((device) => !device.physical);
+    if (devices.length === 0) {
+      Alert.alert("No devices", "This machine has no simulators or emulators to open.");
+      return;
+    }
+    const labels = devices.map((device) =>
       device.version ? `${device.name} · ${device.version}` : device.name,
     );
     ActionSheetIOS.showActionSheetWithOptions(
       { title: "Open a device", options: [...labels, "Cancel"], cancelButtonIndex: labels.length },
       (index) => {
-        const device = openableDevices[index];
+        const device = devices[index];
         if (!device) return;
         awaitingDevicePreview.current = true;
         void openDevice({
@@ -1560,8 +1570,8 @@ function ThreadDetailBody(
                     devicePreview={
                       devicePreviews.length > 0
                         ? { count: devicePreviews.length, onPress: openDevicePreview }
-                        : Platform.OS === "ios" && openableDevices.length > 0
-                          ? { count: 0, onPress: pickDevice }
+                        : canPickDevice
+                          ? { count: 0, onPress: () => void pickDevice() }
                           : null
                     }
                     browserPreview={
