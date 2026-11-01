@@ -6,8 +6,7 @@ import UIKit
 /// Frames go straight to a display layer marked to present immediately, and touches leave from the
 /// main thread as they arrive, so neither direction waits on JavaScript or a WebView.
 final class DirectStreamSurface: UIView {
-  /// Coordinates are 0...1 in the simulator's raw framebuffer, whatever its orientation.
-  var onTouch: ((_ phase: String, _ x: Double, _ y: Double) -> Void)?
+  var onTouch: ((DirectTouchTracker.Output) -> Void)?
   /// `keyboardUsage` is the USB HID usage, which is what `UIKey.keyCode` holds.
   var onKey: ((_ phase: String, _ keyboardUsage: Int) -> Void)?
 
@@ -15,17 +14,18 @@ final class DirectStreamSurface: UIView {
   private let displayLayer = AVSampleBufferDisplayLayer()
   private var videoSize = CGSize(width: 9, height: 19.5)
   private var rotation: CGFloat = 0
-  private var activeTouch: UITouch?
+  private let tracker = DirectTouchTracker()
   private var displayLink: CADisplayLink?
   private var formatDescription: CMVideoFormatDescription?
   private let linkTarget = DisplayLinkTarget()
+  private weak var previousWindow: UIWindow?
   private var lastActivityAt = CACurrentMediaTime()
   private var keepingRateUp = false
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     backgroundColor = .black
-    isMultipleTouchEnabled = false
+    isMultipleTouchEnabled = true
     content.isUserInteractionEnabled = false
     displayLayer.videoGravity = .resize
     content.layer.addSublayer(displayLayer)
@@ -41,6 +41,8 @@ final class DirectStreamSurface: UIView {
     super.didMoveToWindow()
     displayLink?.invalidate()
     displayLink = nil
+    DirectStreamSystemGestures.setDeferred(window != nil, in: window ?? previousWindow)
+    previousWindow = window
     guard window != nil else { return }
     // Asks for the top rate only while frames arrive, so one lands at the next 8 ms refresh rather
     // than the next 16 ms one, and the display can slow down whenever the simulator is still.
@@ -149,33 +151,52 @@ final class DirectStreamSurface: UIView {
     }
   }
 
-  private func report(_ touch: UITouch, phase: String) {
+  private func normalized(_ touch: UITouch) -> DirectTouchTracker.Point? {
     let point = touch.location(in: content)
     let size = content.bounds.size
-    guard size.width > 0, size.height > 0 else { return }
-    onTouch?(
-      phase,
-      Double(max(0, min(1, point.x / size.width))),
-      Double(max(0, min(1, point.y / size.height))))
+    guard size.width > 0, size.height > 0 else { return nil }
+    return DirectTouchTracker.Point(
+      x: Double(max(0, min(1, point.x / size.width))),
+      y: Double(max(0, min(1, point.y / size.height))))
+  }
+
+  private func identifier(for touch: UITouch) -> Int {
+    ObjectIdentifier(touch).hashValue
+  }
+
+  private func emit(_ outputs: [DirectTouchTracker.Output]) {
+    for output in outputs { onTouch?(output) }
+  }
+
+  private func handle(
+    _ touches: Set<UITouch>,
+    _ step: (Int, DirectTouchTracker.Point, Double) -> [DirectTouchTracker.Output]
+  ) {
+    noteActivity()
+    let now = CACurrentMediaTime() * 1000
+    for touch in touches {
+      guard let point = normalized(touch) else { continue }
+      emit(step(identifier(for: touch), point, now))
+    }
   }
 
   override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-    guard activeTouch == nil, let touch = touches.first else { return }
-    noteActivity()
-    activeTouch = touch
-    report(touch, phase: "begin")
+    tracker.edgesEnabled = rotation == 0
+    handle(touches) { self.tracker.began(id: $0, point: $1, now: $2) }
+    // Fires just after the hold ends, because nothing else moves a finger that stays still.
+    DispatchQueue.main.asyncAfter(deadline: .now() + DirectTouchTracker.holdMs / 1000 + 0.001) {
+      [weak self] in
+      guard let self else { return }
+      self.emit(self.tracker.tick(now: CACurrentMediaTime() * 1000))
+    }
   }
 
   override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-    guard let activeTouch, touches.contains(activeTouch) else { return }
-    noteActivity()
-    report(activeTouch, phase: "move")
+    handle(touches) { self.tracker.moved(id: $0, point: $1, now: $2) }
   }
 
   override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-    guard let activeTouch, touches.contains(activeTouch) else { return }
-    report(activeTouch, phase: "end")
-    self.activeTouch = nil
+    handle(touches) { self.tracker.ended(id: $0, point: $1, now: $2) }
   }
 
   override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -192,6 +213,38 @@ final class DirectStreamSurface: UIView {
     for press in presses {
       if let key = press.key { onKey?("up", key.keyCode.rawValue) }
     }
+  }
+}
+
+/// Keeps a swipe from the screen's edges in the stream instead of the phone taking it, the way games
+/// do: while streaming, the first swipe goes to the simulator and a second one reaches iOS.
+enum DirectStreamSystemGestures {
+  fileprivate static var deferred = false
+  private static let installed: Void = {
+    let selector = #selector(getter: UIViewController.preferredScreenEdgesDeferringSystemGestures)
+    guard
+      let original = class_getInstanceMethod(UIViewController.self, selector),
+      let replacement = class_getInstanceMethod(
+        UIViewController.self, #selector(UIViewController.t3_deferredEdges))
+    else { return }
+    method_exchangeImplementations(original, replacement)
+  }()
+
+  static func setDeferred(_ value: Bool, in window: UIWindow?) {
+    _ = installed
+    deferred = value
+    var controller = window?.rootViewController
+    while let current = controller {
+      current.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+      controller = current.presentedViewController
+    }
+  }
+}
+
+extension UIViewController {
+  /// Swapped with the getter, so calling this name reaches the system's own implementation.
+  @objc fileprivate func t3_deferredEdges() -> UIRectEdge {
+    DirectStreamSystemGestures.deferred ? .all : t3_deferredEdges()
   }
 }
 

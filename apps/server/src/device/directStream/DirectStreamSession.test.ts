@@ -236,6 +236,14 @@ describe("DirectStreamSession", () => {
     ]);
   });
 
+  it("forwards two-finger touch", async () => {
+    const { hub, client } = await connected();
+    await client.changes.until(() => client.ofType(MessageType.inputState).at(-1)?.[1] === 1);
+    client.send(inputMessage(1, true, 0x05, "pinch"));
+    await hub.changes.until(() => hub.received.length >= 1);
+    expect(hub.received[0]![0]).toBe(0x05);
+  });
+
   it("will not let a replayed packet move the stream to another address", async () => {
     const { client, offer } = await connected();
     const key = Buffer.from(offer.key, "base64");

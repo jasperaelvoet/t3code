@@ -58,9 +58,19 @@ final class DirectStreamController {
       DispatchQueue.main.async { self?.onInputConnected?(admitted) }
     }
     receiver.onScreen = { [weak self] json in self?.handleScreen(json) }
-    surface.onTouch = { [weak receiver] phase, x, y in
-      let json = String(format: "{\"type\":\"%@\",\"x\":%.5f,\"y\":%.5f}", phase, x, y)
-      receiver?.sendInput(tag: 0x03, json: Data(json.utf8), reliable: phase != "move")
+    surface.onTouch = { [weak receiver] output in
+      switch output {
+      case .single(let phase, let point, let edge):
+        let edgeField = edge == 0 ? "" : ",\"edge\":\(edge)"
+        let json = String(
+          format: "{\"type\":\"%@\",\"x\":%.5f,\"y\":%.5f%@}", phase, point.x, point.y, edgeField)
+        receiver?.sendInput(tag: 0x03, json: Data(json.utf8), reliable: output.isReliable)
+      case .double(let phase, let first, let second):
+        let json = String(
+          format: "{\"type\":\"%@\",\"x1\":%.5f,\"y1\":%.5f,\"x2\":%.5f,\"y2\":%.5f}",
+          phase, first.x, first.y, second.x, second.y)
+        receiver?.sendInput(tag: 0x05, json: Data(json.utf8), reliable: output.isReliable)
+      }
     }
     surface.onKey = { [weak receiver] phase, usage in
       let json = "{\"type\":\"\(phase)\",\"usage\":\(usage)}"

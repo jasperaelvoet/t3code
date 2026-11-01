@@ -177,7 +177,8 @@ final class DirectStreamReceiver {
     }
   }
 
-  /// Hub input message: its tag then JSON. Input the stream cannot recover from losing is sent twice.
+  /// Hub input message: its tag then JSON. A lost touch-down or lift would strand a gesture, so those
+  /// repeat across a span longer than Wi-Fi's usual loss bursts; the host keeps the first it sees.
   func sendInput(tag: UInt8, json: Data, reliable: Bool) {
     lock.lock()
     inputSequence &+= 1
@@ -191,7 +192,13 @@ final class DirectStreamReceiver {
     message.append(tag)
     message.append(json)
     send(message)
-    if reliable { send(message) }
+    if reliable {
+      for delay in [0.006, 0.02] {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) {
+          [weak self] in self?.send(message)
+        }
+      }
+    }
   }
 
   func requestKeyframe() {

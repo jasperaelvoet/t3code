@@ -50,8 +50,8 @@ const AVCC_TAG_DELTA = 3;
 
 const HUB_TAG_SCREEN_CONFIG = 0x82;
 const HUB_TAG_INPUT_ADMITTED = 0x83;
-/** Touch, button, key and orientation; the only hub messages a viewer may send. */
-const FORWARDED_INPUT_TAGS: ReadonlySet<number> = new Set([0x03, 0x04, 0x06, 0x07]);
+/** Touch, button, two-finger touch, key and orientation; the only hub messages a viewer may send. */
+const FORWARDED_INPUT_TAGS: ReadonlySet<number> = new Set([0x03, 0x04, 0x05, 0x06, 0x07]);
 const RECENT_INPUTS = 256;
 
 export interface DirectStreamOptions {

@@ -169,6 +169,12 @@ late with no loss at all, in clusters about one beacon interval apart. The viewe
 every 10 ms with the video service class to discourage radio power saving. That helped in most test
 runs but not all, so treat it as a mitigation.
 
+Touch goes through [`DirectTouchTracker`](../../apps/mobile/modules/t3-device-stream/ios/DirectTouchTracker.swift)
+because the simulator takes either one finger or exactly two, and cannot add a finger to a touch in
+progress. The first finger waits up to 16 ms for a second, or the two fingers of a pinch would begin as
+a tap. A swipe from the bottom carries the hub's `edge` value 3, which is what lets it reach home; the
+other edges work without one. While streaming, the app defers the phone's own edge gestures.
+
 UDP cannot cross T3's relay, so this needs a route to the machine: the same network or a tailnet. The
 offer lists every address the server has, the viewer tries them all at once, and when none answers
 within 1.5 s the preview falls back to the WebView's H.264 over HTTP. The proxy and the hub are
