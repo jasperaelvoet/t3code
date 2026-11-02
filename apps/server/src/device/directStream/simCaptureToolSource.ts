@@ -32,6 +32,9 @@ static IOSurface *surface;
 static os_unfair_lock surfaceLock = OS_UNFAIR_LOCK_INIT;
 static CMVideoFormatDescriptionRef lastFormat;
 static dispatch_queue_t captureQueue;
+static VTPixelTransferSessionRef transfer;
+static CVPixelBufferPoolRef pool;
+static size_t poolWidth, poolHeight;
 
 static NSMutableArray<NSNumber *> *captureGaps, *writtenGaps, *encodeTimes;
 static double lastCaptureAt, lastWrittenAt;
@@ -189,6 +192,48 @@ static bool makeEncoder(size_t width, size_t height) {
   return true;
 }
 
+/// Copies the framebuffer into a frame of our own in the encoder's native 4:2:0. Encoding the BGRA
+/// framebuffer directly measured 4.6 or 11.5 ms a frame at random and dropped frames; the copy takes
+/// 1.1 ms and the encode then a steady 3.7 ms, and the simulator can draw its next frame meanwhile.
+static CVPixelBufferRef copyToYUV(IOSurface *source, size_t width, size_t height) {
+  if (!transfer) {
+    if (VTPixelTransferSessionCreate(NULL, &transfer) != noErr) return NULL;
+    VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                         kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                         kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                         kCVImageBufferTransferFunction_ITU_R_709_2);
+  }
+  if (!pool || poolWidth != width || poolHeight != height) {
+    if (pool) CVPixelBufferPoolRelease(pool);
+    pool = NULL;
+    NSDictionary *attributes = @{
+      (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey :
+          @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+      (__bridge NSString *)kCVPixelBufferWidthKey : @(width),
+      (__bridge NSString *)kCVPixelBufferHeightKey : @(height),
+      (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+    if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &pool) !=
+        kCVReturnSuccess)
+      return NULL;
+    poolWidth = width;
+    poolHeight = height;
+  }
+  CVPixelBufferRef framebuffer = NULL, copy = NULL;
+  if (CVPixelBufferCreateWithIOSurface(NULL, (__bridge IOSurfaceRef)source, NULL, &framebuffer) !=
+      kCVReturnSuccess)
+    return NULL;
+  if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &copy) == kCVReturnSuccess &&
+      VTPixelTransferSessionTransferImage(transfer, framebuffer, copy) != noErr) {
+    CVPixelBufferRelease(copy);
+    copy = NULL;
+  }
+  CVPixelBufferRelease(framebuffer);
+  return copy;
+}
+
 static void captureFrame(void) {
   framesCaptured++;
   recordGap(captureGaps, &lastCaptureAt);
@@ -206,10 +251,8 @@ static void captureFrame(void) {
     height = (size_t)current.height;
     if (!makeEncoder(width, height)) return;
   }
-  CVPixelBufferRef image = NULL;
-  if (CVPixelBufferCreateWithIOSurface(NULL, (__bridge IOSurfaceRef)current, NULL, &image) !=
-      kCVReturnSuccess)
-    return;
+  CVPixelBufferRef image = copyToYUV(current, width, height);
+  if (!image) return;
   NSDictionary *options = nil;
   if (forceKey) {
     forceKey = false;
