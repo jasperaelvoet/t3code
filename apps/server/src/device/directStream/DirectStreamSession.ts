@@ -1,11 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off - Latency-critical sockets and frame handling run outside the Effect runtime, like the hub processes they talk to.
 /**
- * Sends one simulator's H.264 to one native viewer over encrypted UDP and carries its touches back.
- * docs/internals/devices.md explains the design. A frame goes out the moment the hub produces it.
+ * Sends one simulator's video to one native viewer over encrypted UDP, or over USB when the phone is on
+ * a cable, and carries its touches back. docs/internals/devices.md explains the design. A frame goes
+ * out the moment it is encoded.
  */
 import * as NodeCrypto from "node:crypto";
 import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
+import type * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 
 import { initialQuality, nextQuality, type QualityState } from "./adaptiveQuality.ts";
@@ -37,12 +39,23 @@ const FIRST_HELLO_TIMEOUT_MS = 15_000;
 const HUB_RECONNECT_DELAY_MS = 500;
 const CHECK_INTERVAL_MS = 500;
 const REPLAY_WINDOW = 1024n;
+/** A cable connection must prove it reaches this session's viewer this soon, or it is someone else's. */
+const USB_VERIFY_TIMEOUT_MS = 2_000;
+/** A viewer that stops reading a cable connection is gone; past this, stop buffering for it. */
+const USB_MAX_BACKLOG_BYTES = 8 << 20;
 
 /**
  * The simulator still draws at 60 fps, but capturing at 120 means a drawn frame waits less for its
  * capture: touch to screen measured about 50 ms instead of 61 ms on a 6 Mbit/s stream.
  */
 const CAPTURE_FPS = 120;
+
+/**
+ * The hub keeps encoding for any desktop viewer of the same simulator, on the same media engine as
+ * this session's own encoder, and a full size hub stream measured more than doubling our encode: 11 ms
+ * a frame against 5 ms. Capping it while our capture runs costs that viewer some sharpness, not frames.
+ */
+const SHARED_HUB_MAX_DIMENSION = 1280;
 
 const AVCC_TAG_DESCRIPTION = 1;
 const AVCC_TAG_KEYFRAME = 2;
@@ -64,6 +77,14 @@ export interface DirectStreamOptions {
   readonly captureFps?: number;
   /** Encodes for this session alone. The hub's H.264 takes over if this is absent or fails. */
   readonly makeVideoSource?: (bitsPerSecond: number) => DirectVideoSource;
+  /**
+   * Reaches a viewer whose phone is on this machine's cable: the viewer listens on `port`, and
+   * `connect` opens a connection to it on every attached phone listening there. Absent, only UDP.
+   */
+  readonly usb?: {
+    readonly port: number;
+    readonly connect: (port: number) => Promise<ReadonlyArray<NodeNet.Socket>>;
+  };
 }
 
 export interface DirectStreamOffer {
@@ -71,6 +92,8 @@ export interface DirectStreamOffer {
   readonly key: string;
   readonly port: number;
   readonly addresses: ReadonlyArray<string>;
+  /** Where the viewer should listen for a connection over USB, when this host can make one. */
+  readonly usbPort?: number;
 }
 
 export interface DirectStreamStats {
@@ -89,7 +112,15 @@ export interface DirectStreamStats {
   sourceEndedBecause: string | null;
 }
 
-type ViewerAddress = { readonly address: string; readonly port: number };
+/** A datagram from the viewer over UDP, or a length-prefixed one over a USB connection. */
+type ViewerPath =
+  | { readonly kind: "udp"; readonly address: string; readonly port: number }
+  | { readonly kind: "usb"; readonly socket: NodeNet.Socket };
+
+const samePath = (left: ViewerPath | null, right: ViewerPath) =>
+  left?.kind === "udp" && right.kind === "udp"
+    ? left.address === right.address && left.port === right.port
+    : left?.kind === "usb" && right.kind === "usb" && left.socket === right.socket;
 
 /** IPv4 addresses a viewer on another machine could reach; the viewer tries them all at once. */
 function reachableAddresses(includeLoopback = false): ReadonlyArray<string> {
@@ -131,7 +162,9 @@ export class DirectStreamSession {
   private readonly sendQueue: Array<Buffer> = [];
 
   private stopped = false;
-  private viewer: ViewerAddress | null = null;
+  private viewer: ViewerPath | null = null;
+  private readonly usbPaths = new Set<NodeNet.Socket>();
+  private probingUsb = false;
   private lastViewerAt = performance.now();
   private highestViewerSequence = -1n;
   private sendSequence = 0n;
@@ -150,7 +183,8 @@ export class DirectStreamSession {
   private inputAdmitted = false;
   private hubRetry: ReturnType<typeof setTimeout> | null = null;
   private checkTimer: ReturnType<typeof setInterval> | null = null;
-  private restoreCaptureFps: number | null = null;
+  /** Hub stream settings this session changed, with the values to put back when it ends. */
+  private readonly changedHubSettings = new Map<string, number>();
   private videoSource: DirectVideoSource | null = null;
   private videoFlags = 0;
   private quality: QualityState = initialQuality;
@@ -160,7 +194,9 @@ export class DirectStreamSession {
   }
 
   async start(): Promise<DirectStreamOffer> {
-    this.socket.on("message", (packet, remote) => this.handlePacket(packet, remote));
+    this.socket.on("message", (packet, remote) => {
+      this.handlePacket(packet, { kind: "udp", address: remote.address, port: remote.port });
+    });
     this.socket.on("error", () => this.stop("socket error"));
     await new Promise<void>((resolve, reject) => {
       this.socket.once("error", reject);
@@ -175,12 +211,14 @@ export class DirectStreamSession {
       // The system default still works; a keyframe may just need its NACKs.
     }
     this.checkTimer = setInterval(() => this.checkAlive(), CHECK_INTERVAL_MS);
+    this.probeUsb();
     void this.connectHubInput();
     return {
       sessionId: this.sessionId,
       key: this.key.toString("base64"),
       port: this.socket.address().port,
       addresses: reachableAddresses(this.options.includeLoopbackAddress),
+      ...(this.options.usb ? { usbPort: this.options.usb.port } : {}),
     };
   }
 
@@ -197,9 +235,9 @@ export class DirectStreamSession {
     this.videoSource = null;
     this.hubSocket?.close();
     this.hubSocket = null;
-    if (this.restoreCaptureFps !== null) {
-      void this.hubSettings("PATCH", { h264Fps: this.restoreCaptureFps });
-    }
+    for (const path of this.usbPaths) path.end();
+    this.usbPaths.clear();
+    for (const name of this.changedHubSettings.keys()) this.restoreHubSetting(name);
     this.sendQueue.length = 0;
     this.retained.clear();
     // Lets the final datagram leave before the socket goes.
@@ -207,18 +245,30 @@ export class DirectStreamSession {
     this.options.onEnd?.(reason);
   }
 
-  private async raiseCaptureRate() {
-    const target = this.options.captureFps ?? CAPTURE_FPS;
-    const current = await this.hubSettings("GET");
-    if (typeof current?.h264Fps !== "number" || current.h264Fps === target) return;
-    const applied = await this.hubSettings("PATCH", { h264Fps: target });
-    if (!applied) return;
-    // The session may have ended while this was on its way, and then nothing else restores it.
-    if (this.stopped) void this.hubSettings("PATCH", { h264Fps: current.h264Fps });
-    else this.restoreCaptureFps = current.h264Fps;
+  /** Changes one hub stream setting for as long as `wanted` holds; `next` returns null to leave it. */
+  private async changeHubSetting(
+    name: string,
+    next: (current: number) => number | null,
+    wanted: () => boolean,
+  ) {
+    const current = (await this.hubSettings("GET"))?.[name];
+    if (typeof current !== "number" || !wanted()) return;
+    const value = next(current);
+    if (value === null || value === current) return;
+    if (!(await this.hubSettings("PATCH", { [name]: value }))) return;
+    // The session may have moved on while this was on its way, and then nothing else restores it.
+    if (!wanted()) void this.hubSettings("PATCH", { [name]: current });
+    else if (!this.changedHubSettings.has(name)) this.changedHubSettings.set(name, current);
   }
 
-  /** A failure leaves the rate as it was; the stream works at any rate. */
+  private restoreHubSetting(name: string) {
+    const previous = this.changedHubSettings.get(name);
+    if (previous === undefined) return;
+    this.changedHubSettings.delete(name);
+    void this.hubSettings("PATCH", { [name]: previous });
+  }
+
+  /** A failure leaves the setting as it was; the stream works either way. */
   private hubSettings(
     method: "GET" | "PATCH",
     body?: Readonly<Record<string, number>>,
@@ -254,27 +304,87 @@ export class DirectStreamSession {
   }
 
   private checkAlive() {
+    this.probeUsb();
     const silentFor = performance.now() - this.lastViewerAt;
     const limit = this.viewer ? VIEWER_SILENCE_TIMEOUT_MS : FIRST_HELLO_TIMEOUT_MS;
     if (silentFor > limit) this.stop(this.viewer ? "viewer went silent" : "no viewer connected");
   }
 
-  private handlePacket(packet: Buffer, remote: NodeDgram.RemoteInfo) {
-    if (this.stopped) return;
+  /**
+   * Keeps looking for the viewer's phone on a cable until it is reached that way: the viewer may start
+   * listening after the offer, and a phone can be plugged in mid-session.
+   */
+  private probeUsb() {
+    const usb = this.options.usb;
+    if (!usb || this.stopped || this.probingUsb || this.usbPaths.size > 0) return;
+    this.probingUsb = true;
+    void usb.connect(usb.port).then(
+      (sockets) => {
+        this.probingUsb = false;
+        for (const socket of sockets) this.adoptUsbPath(socket);
+      },
+      () => {
+        this.probingUsb = false;
+      },
+    );
+  }
+
+  private adoptUsbPath(socket: NodeNet.Socket) {
+    if (this.stopped) {
+      socket.destroy();
+      return;
+    }
+    this.usbPaths.add(socket);
+    socket.setNoDelay(true);
+    const path: ViewerPath = { kind: "usb", socket };
+    let verified = false;
+    // Another phone on the cable, or one viewing another session, never sends a packet that opens.
+    const verifyTimer = setTimeout(() => {
+      if (!verified) socket.destroy();
+    }, USB_VERIFY_TIMEOUT_MS);
+    let pending: Buffer = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      let offset = 0;
+      while (pending.length - offset >= 2) {
+        const length = pending.readUInt16BE(offset);
+        if (pending.length - offset - 2 < length) break;
+        const packet = pending.subarray(offset + 2, offset + 2 + length);
+        offset += 2 + length;
+        if (this.handlePacket(packet, path)) verified = true;
+        else if (!verified) {
+          socket.destroy();
+          return;
+        }
+      }
+      pending = offset === pending.length ? Buffer.alloc(0) : pending.subarray(offset);
+    });
+    socket.on("error", () => {});
+    socket.once("close", () => {
+      clearTimeout(verifyTimer);
+      this.usbPaths.delete(socket);
+      // The viewer says hello over UDP again once its side of the cable closes.
+      if (this.viewer?.kind === "usb" && this.viewer.socket === socket) this.viewer = null;
+    });
+    socket.resume();
+  }
+
+  /** True when the packet authenticated as this session's viewer. */
+  private handlePacket(packet: Buffer, path: ViewerPath): boolean {
+    if (this.stopped) return false;
     const opened = openPacket(this.key, this.sessionId, "toServer", packet);
-    if (!opened) return;
+    if (!opened) return false;
     const { sequence, plaintext } = opened;
     // Old packets cannot move the stream to another address or replay input.
-    if (sequence + REPLAY_WINDOW < this.highestViewerSequence) return;
+    if (sequence + REPLAY_WINDOW < this.highestViewerSequence) return true;
     const isNewest = sequence > this.highestViewerSequence;
     if (isNewest) this.highestViewerSequence = sequence;
     this.lastViewerAt = performance.now();
     const type = plaintext[0];
     if (isNewest && (!this.viewer || type === MessageType.hello)) {
-      const moved = this.viewer?.address !== remote.address || this.viewer?.port !== remote.port;
-      if (moved) this.viewer = { address: remote.address, port: remote.port };
+      if (!samePath(this.viewer, path)) this.viewer = path;
     }
-    if (!this.viewer) return;
+    if (!this.viewer) return true;
     switch (type) {
       case MessageType.hello:
         this.handleHello(plaintext);
@@ -298,6 +408,7 @@ export class DirectStreamSession {
         this.stop("viewer closed");
         break;
     }
+    return true;
   }
 
   private handleHello(hello: Buffer) {
@@ -315,6 +426,12 @@ export class DirectStreamSession {
     this.stats.videoSource = "capture";
     this.stats.codec = source.codec;
     this.videoFlags = FRAME_FLAG_PARAMETER_SETS | (source.codec === "hevc" ? FRAME_FLAG_HEVC : 0);
+    void this.changeHubSetting(
+      "maxDimension",
+      (current) =>
+        current === 0 || current > SHARED_HUB_MAX_DIMENSION ? SHARED_HUB_MAX_DIMENSION : null,
+      () => !this.stopped && this.videoSource === source,
+    );
     source.start(
       (tag, payload) => {
         if (this.videoSource === source) this.handleAvcc(tag, payload);
@@ -323,6 +440,8 @@ export class DirectStreamSession {
         if (this.stopped || this.videoSource !== source) return;
         this.videoSource = null;
         this.stats.sourceEndedBecause = reason;
+        // The hub's stream is this viewer's now, so it needs the full size again.
+        this.restoreHubSetting("maxDimension");
         this.startHubVideo();
       },
     );
@@ -332,7 +451,12 @@ export class DirectStreamSession {
     this.stats.videoSource = "hub";
     this.stats.codec = "h264";
     this.videoFlags = 0;
-    void this.raiseCaptureRate();
+    const target = this.options.captureFps ?? CAPTURE_FPS;
+    void this.changeHubSetting(
+      "h264Fps",
+      () => target,
+      () => !this.stopped,
+    );
     this.openVideo();
   }
 
@@ -553,10 +677,11 @@ export class DirectStreamSession {
     for (let group = 0; group < groupCount; group++) {
       const first = group * MAX_GROUP_DATA_SHARDS;
       const dataShards = Math.min(MAX_GROUP_DATA_SHARDS, shardCount - first);
-      const parityShards = Math.max(
-        MIN_PARITY_SHARDS,
-        Math.ceil(dataShards * this.quality.parityRatio),
-      );
+      // A cable loses nothing, so parity there would only cost bandwidth.
+      const parityShards =
+        this.viewer.kind === "usb"
+          ? 0
+          : Math.max(MIN_PARITY_SHARDS, Math.ceil(dataShards * this.quality.parityRatio));
       const data: Array<Uint8Array> = [];
       for (let index = 0; index < dataShards; index++) {
         const start = (first + index) * SHARD_BYTES;
@@ -629,7 +754,18 @@ export class DirectStreamSession {
     const packet = sealPacket(this.key, this.sessionId, "toClient", this.sendSequence++, plaintext);
     this.stats.shardsSent++;
     this.stats.bytesSent += packet.length;
-    this.socket.send(packet, viewer.port, viewer.address);
+    if (viewer.kind === "udp") {
+      this.socket.send(packet, viewer.port, viewer.address);
+      return;
+    }
+    if (viewer.socket.writableLength > USB_MAX_BACKLOG_BYTES) {
+      viewer.socket.destroy();
+      return;
+    }
+    const length = Buffer.allocUnsafe(2);
+    length.writeUInt16BE(packet.length, 0);
+    viewer.socket.write(length);
+    viewer.socket.write(packet);
   }
 
   private sendScreen() {

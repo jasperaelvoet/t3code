@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Exercises the session against real sockets, as it runs.
 import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
-import type * as NodeNet from "node:net";
+import * as NodeNet from "node:net";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { NodeWS } from "@effect/platform-node/NodeSocket";
@@ -65,7 +65,7 @@ async function fakeHub() {
         if (request.method === "PATCH") settings.push(body);
         changes.notify();
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ h264Fps: 60 }));
+        response.end(JSON.stringify({ h264Fps: 60, maxDimension: 0 }));
       });
     } else {
       response.writeHead(404);
@@ -342,11 +342,25 @@ describe("DirectStreamSession", () => {
     expect(hub.videoRequests()).toBe(0);
   });
 
-  it("falls back to the hub's video when the capture tool dies", async () => {
+  it("shrinks the hub's own stream while the session encodes, and restores it after", async () => {
     const fake = fakeSource();
     const { hub, session } = await connectedWith(fake);
+    await hub.changes.until(() => hub.settings.length === 1);
+    expect(JSON.parse(hub.settings[0]!)).toEqual({ maxDimension: 1280 });
+    session.stop();
+    await hub.changes.until(() => hub.settings.length === 2);
+    expect(JSON.parse(hub.settings[1]!)).toEqual({ maxDimension: 0 });
+  });
+
+  it("falls back to the hub's full size video when the capture tool dies", async () => {
+    const fake = fakeSource();
+    const { hub, session } = await connectedWith(fake);
+    await hub.changes.until(() => hub.settings.length === 1);
     fake.end("capture exited (1)");
-    await hub.changes.until(() => hub.videoRequests() === 1);
+    await hub.changes.until(() => hub.videoRequests() === 1 && hub.settings.length === 3);
+    expect(hub.settings.slice(1).map((body) => JSON.parse(body))).toEqual(
+      expect.arrayContaining([{ maxDimension: 0 }, { h264Fps: 120 }]),
+    );
     expect(session.stats.videoSource).toBe("hub");
     expect(session.stats.sourceEndedBecause).toBe("capture exited (1)");
   });
@@ -372,6 +386,101 @@ describe("DirectStreamSession", () => {
     const { session } = await connectedWith(fake);
     session.stop();
     expect(fake.calls.stopped).toBe(1);
+  });
+
+  /** The app's end of a cable: a listener the session's `usb.connect` reaches. */
+  async function cable() {
+    const changes = new Changes();
+    const connections: Array<NodeNet.Socket> = [];
+    const server = NodeNet.createServer((socket) => {
+      connections.push(socket);
+      changes.notify();
+    });
+    await new Promise<void>((listening) => server.listen(0, "127.0.0.1", listening));
+    const port = (server.address() as NodeNet.AddressInfo).port;
+    cleanups.push(() => {
+      for (const connection of connections) connection.destroy();
+      server.close();
+    });
+    return {
+      changes,
+      connections,
+      connect: async () => [NodeNet.connect(port, "127.0.0.1")],
+    };
+  }
+
+  /** A viewer speaking length-prefixed packets over one cable connection. */
+  function cableViewer(socket: NodeNet.Socket, offer: DirectStreamOffer) {
+    const key = Buffer.from(offer.key, "base64");
+    const messages: Array<Buffer> = [];
+    const changes = new Changes();
+    let closed = false;
+    let pending = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 2 && pending.length >= 2 + pending.readUInt16BE(0)) {
+        const packet = pending.subarray(2, 2 + pending.readUInt16BE(0));
+        pending = pending.subarray(2 + packet.length);
+        const opened = openPacket(key, offer.sessionId, "toClient", packet);
+        if (opened) messages.push(opened.plaintext);
+      }
+      changes.notify();
+    });
+    socket.on("close", () => {
+      closed = true;
+      changes.notify();
+    });
+    let sequence = 1n;
+    return {
+      changes,
+      send: (plaintext: Buffer, sealKey = key) => {
+        const packet = sealPacket(sealKey, offer.sessionId, "toServer", sequence++, plaintext);
+        const length = Buffer.alloc(2);
+        length.writeUInt16BE(packet.length, 0);
+        socket.write(Buffer.concat([length, packet]));
+      },
+      ofType: (type: number) => messages.filter((message) => message[0] === type),
+      closed: () => closed,
+    };
+  }
+
+  async function startedOnCable() {
+    const phone = await cable();
+    const hub = await fakeHub();
+    const session = new DirectStreamSession({
+      hubOrigin: hub.origin,
+      deviceId: DEVICE,
+      usb: { port: 47_811, connect: phone.connect },
+    });
+    const offer = await session.start();
+    cleanups.push(() => {
+      session.stop();
+      hub.close();
+    });
+    await phone.changes.until(() => phone.connections.length > 0);
+    return { hub, offer, connection: phone.connections[0]! };
+  }
+
+  it("streams over a cable when the phone is on one, without parity", async () => {
+    const { hub, offer, connection } = await startedOnCable();
+    expect(offer.usbPort).toBe(47_811);
+    const client = cableViewer(connection, offer);
+    client.send(Buffer.from([MessageType.hello]));
+    await client.changes.until(() => client.ofType(MessageType.helloAck).length > 0);
+    await hub.changes.until(() => hub.videoRequests() > 0);
+    hub.send(3, Buffer.alloc(SHARD_BYTES * 2, 1));
+    await client.changes.until(() => client.ofType(MessageType.video).length >= 2);
+    const shard = decodeVideoShard(client.ofType(MessageType.video)[0]!)!;
+    expect(shard.header.dataShards).toBe(2);
+    expect(shard.header.parityShards).toBe(0);
+  });
+
+  it("drops a cable connection that is not to this session's viewer", async () => {
+    const { offer, connection } = await startedOnCable();
+    const stranger = cableViewer(connection, offer);
+    stranger.send(Buffer.from([MessageType.hello]), Buffer.alloc(16, 7));
+    await stranger.changes.until(() => stranger.closed());
+    expect(stranger.ofType(MessageType.helloAck)).toEqual([]);
   });
 
   it("tells the caller why it ended", async () => {

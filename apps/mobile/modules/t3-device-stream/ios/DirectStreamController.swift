@@ -25,12 +25,13 @@ final class DirectStreamController {
   ]
 
   init?(
-    sessionId: UInt32, key: Data, hosts: [String], port: UInt16, connectTimeout: TimeInterval,
-    surface: DirectStreamSurface
+    sessionId: UInt32, key: Data, hosts: [String], port: UInt16, usbPort: UInt16?,
+    connectTimeout: TimeInterval, surface: DirectStreamSurface
   ) {
     guard
       let receiver = DirectStreamReceiver(
-        sessionId: sessionId, key: key, hosts: hosts, port: port, connectTimeout: connectTimeout)
+        sessionId: sessionId, key: key, hosts: hosts, port: port, usbPort: usbPort,
+        connectTimeout: connectTimeout)
     else { return nil }
     self.receiver = receiver
     self.surface = surface

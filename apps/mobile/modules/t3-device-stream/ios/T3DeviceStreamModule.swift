@@ -32,6 +32,7 @@ struct DirectStreamOfferRecord: Record {
   @Field var key: String = ""
   @Field var port: Int = 0
   @Field var addresses: [String] = []
+  @Field var usbPort: Int?
 }
 
 final class T3DirectStreamView: ExpoView {
@@ -75,8 +76,8 @@ final class T3DirectStreamView: ExpoView {
       let port = UInt16(exactly: offer.port),
       let sessionId = UInt32(exactly: offer.sessionId),
       let controller = DirectStreamController(
-        sessionId: sessionId, key: key, hosts: offer.addresses, port: port, connectTimeout: 1.5,
-        surface: surface)
+        sessionId: sessionId, key: key, hosts: offer.addresses, port: port,
+        usbPort: offer.usbPort.flatMap { UInt16(exactly: $0) }, connectTimeout: 1.5, surface: surface)
     else {
       onStreamStatus(["status": "failed", "detail": "The direct stream offer was invalid"])
       return

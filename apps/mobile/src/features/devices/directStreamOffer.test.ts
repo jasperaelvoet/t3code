@@ -9,8 +9,14 @@ describe("directStreamOfferFrom", () => {
     expect(directStreamOfferFrom(offer)).toEqual(offer);
   });
 
-  it("rejects malformed offers and offers with no addresses", () => {
+  it("accepts a cable as somewhere to connect", () => {
+    const cableOnly = { ...offer, addresses: [], usbPort: 47811 };
+    expect(directStreamOfferFrom(cableOnly)).toEqual(cableOnly);
+  });
+
+  it("rejects malformed offers and offers with nowhere to connect", () => {
     expect(directStreamOfferFrom({ ...offer, addresses: [] })).toBeNull();
+    expect(directStreamOfferFrom({ ...offer, usbPort: "47811" })).toBeNull();
     expect(directStreamOfferFrom({ ...offer, port: "5000" })).toBeNull();
     expect(directStreamOfferFrom(null)).toBeNull();
   });

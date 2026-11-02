@@ -11,8 +11,15 @@ import * as ServerConfig from "../config.ts";
 import * as DeviceService from "./DeviceService.ts";
 import { DirectStreamSession } from "./directStream/DirectStreamSession.ts";
 import { ensureSimCaptureTool, makeSimCaptureSource } from "./directStream/SimCaptureSource.ts";
+import { connectAttachedPhones } from "./directStream/usbmux.ts";
 
 const DIRECT_STREAM_PATH = `${DeviceService.DEVICE_HUB_ROUTE_PREFIX}/direct-stream`;
+
+/**
+ * Where the iOS app listens for the stream over a cable. The phone is on this server's machine whichever
+ * host runs the simulator, so every session offers it.
+ */
+const DIRECT_STREAM_USB_PORT = 47_811;
 
 const SIMULATOR_UDID = /^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$/;
 
@@ -48,6 +55,7 @@ const handler = Effect.fn("DirectStreamRoute.handler")(function* (
   const session: DirectStreamSession = new DirectStreamSession({
     hubOrigin: ready.hub.origin,
     deviceId,
+    usb: { port: DIRECT_STREAM_USB_PORT, connect: (port) => connectAttachedPhones(port) },
     ...(captureTool
       ? {
           makeVideoSource: (bitsPerSecond: number) =>

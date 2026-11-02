@@ -138,9 +138,9 @@ subagent's context is not isolated.
 Watching a simulator from a phone is only usable if a touch lands within a few frames, and what costs
 time there is the WebView: canvas copies, JavaScript on every touch, and a WebRTC jitter buffer built
 for calls. So the iOS app has its own path, the same way game streaming does it. The
-[server](../../apps/server/src/device/directStream/DirectStreamSession.ts) sends the hub's H.264 over
-UDP with no buffering, and a [native module](../../apps/mobile/modules/t3-device-stream) decodes it in
-hardware into a display layer and sends touches back from the main thread.
+[server](../../apps/server/src/device/directStream/DirectStreamSession.ts) sends video over UDP with no
+buffering, and a [native module](../../apps/mobile/modules/t3-device-stream) decodes it in hardware
+into a display layer and sends touches back from the main thread.
 
 The server also skips the hub's encoder when it can.
 [`simCaptureToolSource.ts`](../../apps/server/src/device/directStream/simCaptureToolSource.ts) holds a
@@ -149,8 +149,15 @@ callback rather than polling the framebuffer, and encodes each frame in hardware
 encoder, so it can use HEVC when the phone decodes it, force a keyframe at once, and change its bitrate
 as the link changes, none of which is possible on the hub's shared encoder. It relies on private
 CoreSimulator API, so when the tool cannot build or dies the session continues on the hub's H.264. AV1
-is not an option: Apple silicon decodes it but has no hardware encoder for it. The simulator draws at
-60 fps, so capture cannot produce more; a 120 Hz display only shortens the wait for a refresh.
+is not an option: Apple silicon decodes it but has no hardware encoder for it. The simulator's screen
+offers no refresh rate but 60 Hz, so capture cannot produce more; a 120 Hz display only shortens the
+wait for a refresh.
+
+Two things decide how long the encoder takes. It copies each frame into 4:2:0 first, because encoding
+the BGRA framebuffer directly took 4.6 or 11.5 ms a frame at random, against 1.1 ms for the copy and a
+steady 3.7 ms to encode. And the hub keeps encoding full size H.264 for a desktop viewer of the same
+simulator, on the same media engine, which measured more than doubling our encode, so the session caps
+the hub's stream at 1280 pixels while its own capture runs and restores the setting after.
 
 The viewer gets a one-session AES key by asking
 [the route](../../apps/server/src/device/DirectStreamRoute.ts) over the authenticated environment
@@ -165,8 +172,9 @@ and round trip, and [`adaptiveQuality.ts`](../../apps/server/src/device/directSt
 backs the bitrate off quickly under sustained loss or queueing and raises it slowly otherwise.
 
 What is left of the latency and stutter is mostly outside the stream, so measure before tuning it. On
-an iPhone 15 Pro over Wi-Fi, a frame takes about 40 ms from the simulator drawing it to being decoded,
-then about 20 ms to reach the screen, which is what iOS's display path costs at 120 Hz: a
+an iPhone 15 Pro, a frame Safari draws takes about 21 ms inside the simulator before capture sees it,
+and a touch waits up to a frame there before the app gets it. From draw to decoded on the phone is
+about 38 ms, then about 20 ms to reach the screen, which is what iOS's display path costs at 120 Hz: a
 `CAMetalDisplayLink` measured no better than presenting a Metal layer directly. Heavy apps hitch on
 their own, with the simulator itself not drawing for up to 230 ms while panning Maps, and a stream
 cannot show frames that were never drawn. Wi-Fi adds stalls of its own, sometimes in clusters about one
@@ -179,9 +187,18 @@ progress. The first finger waits up to 16 ms for a second, or the two fingers of
 a tap. A swipe from the bottom carries the hub's `edge` value 3, which is what lets it reach home; the
 other edges work without one. While streaming, the app defers the phone's own edge gestures.
 
-UDP cannot cross T3's relay, so this needs a route to the machine: the same network or a tailnet. The
-offer lists every address the server has, the viewer tries them all at once, and when none answers
-within 1.5 s the preview falls back to the WebView's H.264 over HTTP. The proxy and the hub are
+A phone on the server's cable skips Wi-Fi altogether. The viewer listens on a loopback port the offer
+names, and the session asks usbmuxd, which Xcode uses to reach devices, to connect there on every
+attached iPhone; [`usbmux.ts`](../../apps/server/src/device/directStream/usbmux.ts) is that client. The
+connection carries the same sealed packets, each after a u16 length, without parity since a cable
+loses nothing. A connection that does not open as this session's viewer within 2 s is closed, and the
+viewer moves to the cable whenever the host answers on it, so plugging in mid-session upgrades the
+stream. Measured on the same phone, the cable took the round trip from about 5 ms to 1.2 ms and the
+95th percentile of pan latency from over 400 ms to 18 ms, because Wi-Fi's stalls were gone.
+
+UDP cannot cross T3's relay, so without a cable this needs a route to the machine: the same network or
+a tailnet. The offer lists every address the server has, the viewer tries them all at once, and when
+none answers within 1.5 s the preview falls back to the WebView's H.264 over HTTP. The proxy and the hub are
 unchanged, and web and Android clients do not use this.
 
 ## The viewer decodes both vendored protocols
