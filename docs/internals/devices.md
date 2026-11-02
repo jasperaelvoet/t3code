@@ -164,10 +164,14 @@ stays incomplete means showing nothing new until that keyframe. Twice a second t
 and round trip, and [`adaptiveQuality.ts`](../../apps/server/src/device/directStream/adaptiveQuality.ts)
 backs the bitrate off quickly under sustained loss or queueing and raises it slowly otherwise.
 
-Most of what is left of the stutter is Wi-Fi: frames leave evenly and can reach a phone up to 190 ms
-late with no loss at all, in clusters about one beacon interval apart. The viewer sends a small packet
-every 10 ms with the video service class to discourage radio power saving. That helped in most test
-runs but not all, so treat it as a mitigation.
+What is left of the latency and stutter is mostly outside the stream, so measure before tuning it. On
+an iPhone 15 Pro over Wi-Fi, a frame takes about 40 ms from the simulator drawing it to being decoded,
+then about 20 ms to reach the screen, which is what iOS's display path costs at 120 Hz: a
+`CAMetalDisplayLink` measured no better than presenting a Metal layer directly. Heavy apps hitch on
+their own, with the simulator itself not drawing for up to 230 ms while panning Maps, and a stream
+cannot show frames that were never drawn. Wi-Fi adds stalls of its own, sometimes in clusters about one
+beacon interval apart, so the viewer sends a small packet every 10 ms with the video service class to
+discourage radio power saving. That helped in most test runs but not all, so treat it as a mitigation.
 
 Touch goes through [`DirectTouchTracker`](../../apps/mobile/modules/t3-device-stream/ios/DirectTouchTracker.swift)
 because the simulator takes either one finger or exactly two, and cannot add a finger to a touch in

@@ -73,6 +73,7 @@ export function makeSimCaptureSource(options: {
   readonly deviceId: string;
   readonly codec: CaptureCodec;
   readonly bitsPerSecond: number;
+  readonly onLog?: (line: string) => void;
 }): DirectVideoSource {
   let child: NodeChildProcess.ChildProcessWithoutNullStreams | null = null;
   const command = (line: string) => {
@@ -101,6 +102,8 @@ export function makeSimCaptureSource(options: {
         }
         pending = offset === pending.length ? Buffer.alloc(0) : pending.subarray(offset);
       });
+      // Read even when unused: a full pipe would block the tool between frames.
+      spawned.stderr.on("data", (chunk: Buffer) => options.onLog?.(chunk.toString()));
       spawned.stdin.on("error", () => {});
       spawned.once("error", (error) => onEnd(error.message));
       spawned.once("exit", (code, signal) => {

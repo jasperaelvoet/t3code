@@ -53,7 +53,8 @@ final class DirectStreamDecoder {
     var infoFlags = VTDecodeInfoFlags()
     let status = VTDecompressionSessionDecodeFrame(
       session, sampleBuffer: sample,
-      flags: [._EnableAsynchronousDecompression, ._1xRealTimePlayback],
+      // Not 1xRealTimePlayback: it lets the decoder run slower, measured 9.3 ms a frame against 6.8.
+      flags: [._EnableAsynchronousDecompression],
       infoFlagsOut: &infoFlags
     ) { [weak self] status, _, image, _, _ in
       guard let self else { return }
@@ -91,6 +92,7 @@ final class DirectStreamDecoder {
     let attributes: [CFString: Any] = [
       kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
       kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+      kCVPixelBufferMetalCompatibilityKey: true,
     ]
     var created: VTDecompressionSession?
     let status = VTDecompressionSessionCreate(

@@ -33,6 +33,30 @@ static os_unfair_lock surfaceLock = OS_UNFAIR_LOCK_INIT;
 static CMVideoFormatDescriptionRef lastFormat;
 static dispatch_queue_t captureQueue;
 
+static NSMutableArray<NSNumber *> *captureGaps, *writtenGaps, *encodeTimes;
+static double lastCaptureAt, lastWrittenAt;
+static os_unfair_lock statsLock = OS_UNFAIR_LOCK_INIT;
+
+static NSString *summarize(NSMutableArray<NSNumber *> *values) {
+  NSArray<NSNumber *> *sorted = [values sortedArrayUsingSelector:@selector(compare:)];
+  [values removeAllObjects];
+  if (sorted.count == 0) return @"-";
+  double (^at)(double) = ^(double p) {
+    return sorted[(NSUInteger)((sorted.count - 1) * p)].doubleValue * 1000;
+  };
+  return [NSString stringWithFormat:@"n=%lu p50=%.1f p95=%.1f max=%.1f", (unsigned long)sorted.count,
+                                    at(0.5), at(0.95), at(1)];
+}
+
+static void recordGap(NSMutableArray<NSNumber *> *values, double *last) {
+  if (!values) return;
+  double now = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
+  os_unfair_lock_lock(&statsLock);
+  if (*last > 0) [values addObject:@(now - *last)];
+  *last = now;
+  os_unfair_lock_unlock(&statsLock);
+}
+
 static void writeAll(const void *bytes, size_t length) {
   const uint8_t *cursor = bytes;
   while (length > 0) {
@@ -85,8 +109,14 @@ static void encoded(void *refcon, void *frameRefcon, OSStatus status, VTEncodeIn
                     CMSampleBufferRef sample) {
   framesInEncoder--;
   if (sample) {
-    encodeSeconds += CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()),
+    double seconds = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()),
                                                      CMSampleBufferGetPresentationTimeStamp(sample)));
+    encodeSeconds += seconds;
+    if (encodeTimes) {
+      os_unfair_lock_lock(&statsLock);
+      [encodeTimes addObject:@(seconds)];
+      os_unfair_lock_unlock(&statsLock);
+    }
   }
   if (status != noErr || !sample || !CMSampleBufferDataIsReady(sample)) {
     forceKey = true;
@@ -110,6 +140,7 @@ static void encoded(void *refcon, void *frameRefcon, OSStatus status, VTEncodeIn
   if (CMBlockBufferGetDataPointer(block, 0, NULL, &length, &bytes) != noErr) return;
   writeMessage(isKey ? TAG_KEY : TAG_DELTA, bytes, length);
   framesWritten++;
+  recordGap(writtenGaps, &lastWrittenAt);
   bytesWritten += (int64_t)length;
 }
 
@@ -142,6 +173,8 @@ static bool makeEncoder(size_t width, size_t height) {
   VTSessionSetProperty(encoder, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
   VTSessionSetProperty(encoder, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
                        kCFBooleanTrue);
+  VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxFrameDelayCount,
+                       (__bridge CFNumberRef) @0);
   VTSessionSetProperty(encoder, kVTCompressionPropertyKey_ProfileLevel,
                        codec == kCMVideoCodecType_HEVC ? kVTProfileLevel_HEVC_Main_AutoLevel
                                                        : kVTProfileLevel_H264_High_AutoLevel);
@@ -158,6 +191,7 @@ static bool makeEncoder(size_t width, size_t height) {
 
 static void captureFrame(void) {
   framesCaptured++;
+  recordGap(captureGaps, &lastCaptureAt);
   os_unfair_lock_lock(&surfaceLock);
   IOSurface *current = surface;
   os_unfair_lock_unlock(&surfaceLock);
@@ -270,15 +304,20 @@ int main(int argc, char **argv) {
     // Something to send straight away, even when the screen is still.
     dispatch_async(captureQueue, ^{ captureFrame(); });
     if (getenv("T3_CAPTURE_STATS")) {
+      captureGaps = [NSMutableArray array];
+      writtenGaps = [NSMutableArray array];
+      encodeTimes = [NSMutableArray array];
       dispatch_source_t stats =
           dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
       dispatch_source_set_timer(stats, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC,
                                 0);
       dispatch_source_set_event_handler(stats, ^{
-        fprintf(stderr, "captured=%lld written=%lld dropped=%lld encodeMs=%.1f mbit=%.2f\n",
-                framesCaptured, framesWritten, framesDropped,
-                framesWritten ? encodeSeconds * 1000 / (double)framesWritten : 0,
-                bytesWritten * 8.0 / 1e6 / (framesWritten / 60.0 + 0.001));
+        os_unfair_lock_lock(&statsLock);
+        NSString *line = [NSString stringWithFormat:@"capture[%@] written[%@] encode[%@] dropped=%lld",
+                                                    summarize(captureGaps), summarize(writtenGaps),
+                                                    summarize(encodeTimes), framesDropped];
+        os_unfair_lock_unlock(&statsLock);
+        fprintf(stderr, "%s\n", line.UTF8String);
       });
       dispatch_resume(stats);
       (void)CFBridgingRetain(stats);

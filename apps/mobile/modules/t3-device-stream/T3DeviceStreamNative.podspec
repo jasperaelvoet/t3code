@@ -13,7 +13,7 @@ Pod::Spec.new do |s|
   s.platforms = { :ios => '16.4' }
   s.source = { :path => '.' }
   s.source_files = 'ios/**/*.swift'
-  s.frameworks = 'AVFoundation', 'CoreMedia', 'CoreVideo', 'UIKit', 'VideoToolbox'
+  s.frameworks = 'CoreMedia', 'CoreVideo', 'Metal', 'QuartzCore', 'UIKit', 'VideoToolbox'
   s.swift_version = '5.9'
   s.dependency 'ExpoModulesCore'
 end

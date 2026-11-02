@@ -1,4 +1,3 @@
-import AVFoundation
 import UIKit
 
 /// Shows decoded frames and turns touches into the simulator's coordinates.
@@ -7,16 +6,20 @@ import UIKit
 /// main thread as they arrive, so neither direction waits on JavaScript or a WebView.
 final class DirectStreamSurface: UIView {
   var onTouch: ((DirectTouchTracker.Output) -> Void)?
+  /// When frames reach the screen, for measuring.
+  var onPresented: ((_ decodedAt: CFTimeInterval, _ presentedAt: CFTimeInterval) -> Void)? {
+    get { renderer?.onPresented }
+    set { renderer?.onPresented = newValue }
+  }
   /// `keyboardUsage` is the USB HID usage, which is what `UIKey.keyCode` holds.
   var onKey: ((_ phase: String, _ keyboardUsage: Int) -> Void)?
 
   private let content = UIView()
-  private let displayLayer = AVSampleBufferDisplayLayer()
+  private let renderer = DirectStreamRenderer()
   private var videoSize = CGSize(width: 9, height: 19.5)
   private var rotation: CGFloat = 0
   private let tracker = DirectTouchTracker()
   private var displayLink: CADisplayLink?
-  private var formatDescription: CMVideoFormatDescription?
   private let linkTarget = DisplayLinkTarget()
   private weak var previousWindow: UIWindow?
   private var lastActivityAt = CACurrentMediaTime()
@@ -27,8 +30,7 @@ final class DirectStreamSurface: UIView {
     backgroundColor = .black
     isMultipleTouchEnabled = true
     content.isUserInteractionEnabled = false
-    displayLayer.videoGravity = .resize
-    content.layer.addSublayer(displayLayer)
+    if let renderer { content.layer.addSublayer(renderer.layer) }
     addSubview(content)
   }
 
@@ -87,7 +89,8 @@ final class DirectStreamSurface: UIView {
       origin: .zero, size: CGSize(width: videoSize.width * scale, height: videoSize.height * scale))
     content.center = CGPoint(x: bounds.midX, y: bounds.midY)
     content.transform = CGAffineTransform(rotationAngle: rotation)
-    displayLayer.frame = content.bounds
+    renderer?.layer.frame = content.bounds
+    renderer?.layer.contentsScale = window?.screen.scale ?? 3
     CATransaction.commit()
   }
 
@@ -116,39 +119,7 @@ final class DirectStreamSurface: UIView {
         self?.relayout()
       }
     }
-    if formatDescription == nil
-      || !CMVideoFormatDescriptionMatchesImageBuffer(formatDescription!, imageBuffer: image)
-    {
-      var created: CMVideoFormatDescription?
-      CMVideoFormatDescriptionCreateForImageBuffer(
-        allocator: kCFAllocatorDefault, imageBuffer: image, formatDescriptionOut: &created)
-      formatDescription = created
-    }
-    guard let formatDescription else { return }
-    var timing = CMSampleTimingInfo(
-      duration: .invalid, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-      decodeTimeStamp: .invalid)
-    var sample: CMSampleBuffer?
-    guard
-      CMSampleBufferCreateReadyWithImageBuffer(
-        allocator: kCFAllocatorDefault, imageBuffer: image, formatDescription: formatDescription,
-        sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample,
-      let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true)
-    else { return }
-    let dictionary = unsafeBitCast(
-      CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-    CFDictionarySetValue(
-      dictionary,
-      Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-      Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-    if #available(iOS 17.0, *) {
-      let renderer = displayLayer.sampleBufferRenderer
-      if renderer.status == .failed { renderer.flush() }
-      renderer.enqueue(sample)
-    } else {
-      if displayLayer.status == .failed { displayLayer.flush() }
-      displayLayer.enqueue(sample)
-    }
+    renderer?.display(image)
   }
 
   private func normalized(_ touch: UITouch) -> DirectTouchTracker.Point? {
